@@ -1,0 +1,48 @@
+# Python
+**/__pycache__/
+*.pyc
+.venv/
+
+# Editor
+.vscode/
+.idea/
+
+# Runtime
+*.pid
+*.sock
+nohup.out
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data / models
+processed/*.parquet
+models/*.pt
+
+# logs
+*.log
+
+# etc
+*.zip
+*.hwp
+*.pdf
+*.pptx
+*.docx
+*.csv
+
+research/
+results/
+data/
+
+plot_*.py
+src/TCN_all_classes/
+src/TCN_Transformer/check_misuse.py
+src/TCN_Transformer/test_train.py
+src/AutoEncoder/check_label.py
+src/preprocess/misuse_sets.py
+src/preprocess/test_*.py
+
+
+# Exceptions
+!processed/flows_test_scaled.parquet
