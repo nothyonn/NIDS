@@ -12,7 +12,7 @@ from preprocess import FlowWindowDataset
 from TCN_Transformer import TCNTransformerModel
 from AutoEncoder import TCNAutoencoder
 
-from engine.fusion_model import compute_ae_scores, update_recall_stats
+from .fusion_model import compute_ae_scores, update_recall_stats
 
 
 @torch.no_grad()

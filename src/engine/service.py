@@ -15,7 +15,7 @@ import requests
 from preprocess import FlowWindowDataset
 from TCN_Transformer import TCNTransformerModel
 from AutoEncoder import TCNAutoencoder
-from fusion_model import compute_ae_scores
+from .fusion_model import compute_ae_scores
 
 
 @dataclass
