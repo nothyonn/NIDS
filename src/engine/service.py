@@ -211,21 +211,50 @@ class FusionService:
                 # (window_id는 단순 카운터로; 나중에 dst_ip/time을 window feature에서 넣어도 됨)
                 payloads = []
                 for i in range(B):
+                    # ---- decision 생성 ----
+                    tcn_attack_classes = [
+                        self.label_classes[j]
+                        for j in range(1, self.num_classes)
+                        if preds[i, j]
+                    ]
+
+                    if tcn_attack_classes:
+                        decision = {
+                            "source": "TCN",
+                            "attack": True,
+                            "attack_types": tcn_attack_classes,
+                            "confidence": {
+                                self.label_classes[j]: float(probs[i, j].item())
+                                for j in range(1, self.num_classes)
+                                if preds[i, j]
+                            },
+                        }
+
+                    elif ae_recovered_mask[i]:
+                        decision = {
+                            "source": "AE",
+                            "attack": True,
+                            "attack_types": ["ANOMALY"],
+                            "ae_score": float(ae_scores_all[i].item()),
+                            "ae_threshold": self.ae_threshold,
+                        }
+
+                    else:
+                        decision = {
+                            "source": "NONE",
+                            "attack": False,
+                            "attack_types": [],
+                        }
+
                     event = {
                         "window_id": f"b{b_idx}_i{i}",
-                        "pred": {
-                            "tcn_attack_any": bool(pred_attack_any[i].item()),
-                            "fusion_attack_any": bool(fusion_attack_any[i].item()),
-                            "ae_score": None if torch.isnan(ae_scores_all[i]) else float(ae_scores_all[i].item()),
-                        },
+                        "decision": decision,
                         "meta": {
-                            "ae_threshold": self.ae_threshold,
-                            "agg_mode": self.ae_agg_mode,
-                            "topk": self.ae_topk,
                             "seq_len": self.seq_len,
                             "stride": self.stride,
                         },
                     }
+
                     payloads.append({
                         "event": event,
                         "host": splunk.host,
