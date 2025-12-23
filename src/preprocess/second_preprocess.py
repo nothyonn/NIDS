@@ -203,13 +203,17 @@ config = {
     "other_port_idx": int(other_port_idx),
     "proto_idx_map": {str(k): int(v) for k, v in proto_idx_map.items()},
     "proto_other_idx": int(proto_other_idx),
+
+    "imputer": {
+        "median": {k: float(v) for k, v in train_medians.to_dict().items()}
+    },
+
     "scaler": {
-        "mean": means.to_dict(),
-        "std": stds.to_dict(),
+        "mean": {k: float(v) for k, v in means.to_dict().items()},
+        "std": {k: float(v) for k, v in stds.to_dict().items()},
     },
 }
 
-# 멀티라벨용 클래스 목록 (윈도우 타겟 만들 때 사용)
 config["label_classes"] = sorted(df["Label"].unique().tolist())
 
 with open(CONFIG_OUT, "w", encoding="utf-8") as f:
@@ -217,3 +221,4 @@ with open(CONFIG_OUT, "w", encoding="utf-8") as f:
 
 print(" -", CONFIG_OUT)
 print("\n[DONE] 2차 전처리 완료.")
+

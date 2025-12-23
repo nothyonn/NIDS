@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import List, Dict, Any
+
+import pandas as pd
 from fastapi import FastAPI
 from pydantic import BaseModel
 
@@ -10,14 +13,12 @@ from engine.service import FusionService, SplunkHECConfig
 
 app = FastAPI()
 
-ROOT_DIR = Path(__file__).resolve().parents[1]  # 프로젝트 루트(NIDS) 기준으로 맞춰짐
+ROOT_DIR = Path(__file__).resolve().parents[1]  # NIDS 루트
 
-# ---- Splunk HEC (환경변수로 받는 걸 권장) ----
 SPLUNK_HEC_URL = os.getenv("SPLUNK_HEC_URL", "http://192.168.8.129:8088/services/collector")
 SPLUNK_HEC_TOKEN = os.getenv("SPLUNK_HEC_TOKEN", "")
 SPLUNK_INDEX = os.getenv("SPLUNK_INDEX", "main")
 
-# ---- 서비스 초기화 (서버 시작 시 1번 로드) ----
 svc = FusionService(
     root_dir=ROOT_DIR,
     config_rel="processed/preprocess_config.json",
@@ -36,20 +37,17 @@ class ReplayReq(BaseModel):
     max_batches: int = 10
     sleep_sec: float = 0.0
 
+class IngestReq(BaseModel):
+    flows: List[Dict[str, Any]]
+    run_max_batches: int = 10
+    drop_label: bool = False
+
 @app.get("/health")
 def health():
     return {"ok": True}
 
-@app.post("/replay")
-def replay(req: ReplayReq):
-    if not SPLUNK_HEC_TOKEN:
-        return {
-            "ok": False,
-            "error": "SPLUNK_HEC_TOKEN env var is empty. Set it first.",
-            "hint": "export SPLUNK_HEC_TOKEN='xxxxx' (and optionally SPLUNK_HEC_URL)",
-        }
-
-    splunk = SplunkHECConfig(
+def _make_splunk():
+    return SplunkHECConfig(
         url=SPLUNK_HEC_URL,
         token=SPLUNK_HEC_TOKEN,
         index=SPLUNK_INDEX,
@@ -59,10 +57,38 @@ def replay(req: ReplayReq):
         timeout_sec=3,
     )
 
+@app.post("/replay")
+def replay(req: ReplayReq):
+    if not SPLUNK_HEC_TOKEN:
+        return {"ok": False, "error": "SPLUNK_HEC_TOKEN env var is empty."}
+
     summary = svc.infer_parquet_and_send(
         parquet_rel=req.parquet_rel,
-        splunk=splunk,
+        splunk=_make_splunk(),
         max_batches=req.max_batches,
         sleep_sec=req.sleep_sec,
     )
     return {"ok": True, "summary": summary}
+
+@app.post("/ingest")
+def ingest(req: IngestReq):
+    if not SPLUNK_HEC_TOKEN:
+        return {"ok": False, "error": "SPLUNK_HEC_TOKEN env var is empty."}
+
+    if not req.flows:
+        return {"ok": False, "msg": "empty flows"}
+
+    df = pd.DataFrame(req.flows)
+    if req.drop_label and "Label" in df.columns:
+        df = df.drop(columns=["Label"])
+
+    tmp_path = Path("/tmp/ingest_live.parquet")
+    df.to_parquet(tmp_path, index=False)
+
+    summary = svc.infer_parquet_and_send(
+        parquet_path=str(tmp_path),     # service.py에서 지원해야 함
+        splunk=_make_splunk(),
+        max_batches=req.run_max_batches,
+        sleep_sec=0.0,
+    )
+    return {"ok": True, "summary": summary, "tmp_parquet": str(tmp_path)}

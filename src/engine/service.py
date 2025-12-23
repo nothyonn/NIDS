@@ -131,6 +131,7 @@ class FusionService:
     def infer_parquet_and_send(
         self,
         parquet_rel: str = "processed/flows_test_scaled.parquet",
+        parquet_path: Optional[str | Path] = None,  # ✅ 추가: 절대/상대 parquet 경로 직접 지정
         splunk: Optional[SplunkHECConfig] = None,
         max_batches: Optional[int] = 10,
         sleep_sec: float = 0.0,
@@ -138,12 +139,21 @@ class FusionService:
         """
         parquet를 FlowWindowDataset으로 윈도잉 → 배치 추론 → (옵션) Splunk HEC 전송
 
+        - parquet_path가 주어지면 그걸 우선 사용
+        - 아니면 root_dir/parquet_rel 사용
+
         return: 요약 통계
         """
-        parquet_path = (self.root_dir / parquet_rel).resolve()
+        if parquet_path is not None:
+            parquet_path_resolved = Path(parquet_path).expanduser().resolve()
+        else:
+            parquet_path_resolved = (self.root_dir / parquet_rel).resolve()
+
+        if not parquet_path_resolved.exists():
+            raise FileNotFoundError(f"parquet not found: {parquet_path_resolved}")
 
         ds = FlowWindowDataset(
-            parquet_path=str(parquet_path),
+            parquet_path=str(parquet_path_resolved),
             config_path=str(self.config_path),
             seq_len=self.seq_len,
             stride=self.stride,
@@ -178,7 +188,6 @@ class FusionService:
             pred_attack_any = preds[:, 1:].any(dim=1)      # [B]
 
             # --- AE (TCN이 놓친 것만) ---
-            # 여기선 GT(y)를 굳이 쓰지 않고 "TCN이 benign이라 본 것 중 AE 이상"을 추가 탐지로 사용
             idx_missed = torch.nonzero(~pred_attack_any, as_tuple=True)[0]  # [N_missed]
 
             ae_recovered_mask = torch.zeros_like(pred_attack_any)
@@ -207,8 +216,6 @@ class FusionService:
 
             # ---- send to Splunk ----
             if splunk is not None:
-                # per-window event 생성
-                # (window_id는 단순 카운터로; 나중에 dst_ip/time을 window feature에서 넣어도 됨)
                 payloads = []
                 for i in range(B):
                     # ---- decision 생성 ----
@@ -277,6 +284,7 @@ class FusionService:
             "fusion_pred_attack_windows": fusion_pred_attack,
             "sent_events": sent_events,
             "max_batches": max_batches,
+            "parquet_used": str(parquet_path_resolved),
         }
 
     def _send_hec_batch(self, splunk: SplunkHECConfig, payloads: List[Dict[str, Any]]) -> int:
