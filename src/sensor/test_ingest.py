@@ -1,10 +1,12 @@
-# scripts/test_ingest.py
+# src/sensor/test_ingest.py
 from __future__ import annotations
 
 import argparse
 import json
 import random
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Dict, List
 
 import requests
 
@@ -14,42 +16,46 @@ def load_config(config_path: Path) -> dict:
         return json.load(f)
 
 
-def build_flow_from_config(cfg: dict, *, sport: int, dport: int, proto: int) -> dict:
-    """
-    모델이 학습에서 쓰던 컬럼 스키마에 맞춰:
-    - numeric_cols는 config.imputer.median 값으로 전부 채움 (NaN 방지)
-    - Source/Destination Port, Protocol도 넣어줌
-    """
-    numeric_cols = cfg["numeric_cols"]
-    med = cfg.get("imputer", {}).get("median", {})
+def now_ts_str() -> str:
+    # 모델 코드가 문자열로 strip/처리하니까 문자열로 넣기
+    # (형식 엄격하면 CICFlowMeter 형식으로 바꾸면 됨)
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
-    flow = {}
 
-    # 1) 필수 categorical/raw fields (FlowWindowDataset에서 매핑할 가능성이 큼)
+def build_flow(cfg: dict, *, sport: int, dport: int, proto: int) -> Dict[str, Any]:
+    numeric_cols: List[str] = cfg["numeric_cols"]
+    med: Dict[str, Any] = cfg.get("imputer", {}).get("median", {})
+
+    flow: Dict[str, Any] = {}
+
+    # ===== (A) FlowWindowDataset이 기대하는 "기본 필드"들 =====
+    flow["Timestamp"] = now_ts_str()
+    flow["Source IP"] = "192.168.8.131"
+    flow["Destination IP"] = "192.168.8.130"
+
+    # CICFlowMeter 스타일 raw 필드
     flow["Source Port"] = int(sport)
     flow["Destination Port"] = int(dport)
     flow["Protocol"] = int(proto)
 
-    # 2) numeric feature 전부 채우기 (기본은 train median)
+    # 있으면 도움이 되는 메타 (없어도 되지만, 일부 코드가 기대하면 안전)
+    flow["source_file"] = "sensor_ingest_test"
+
+    # ===== (B) numeric feature들: median으로 채워서 NaN 방지 =====
     for c in numeric_cols:
         v = med.get(c, 0.0)
-        # json 직렬화 안전하게 float로
         flow[c] = float(v) if v is not None else 0.0
-
-    # 3) 테스트용으로 약간 흔들고 싶으면 일부 값 랜덤 노이즈 (원하면 주석 해제)
-    # flow["Flow Duration"] *= random.uniform(0.8, 1.2)
-    # flow["Flow Bytes/s"] *= random.uniform(0.8, 1.2)
 
     return flow
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model-url", default="http://192.168.8.130:8001", help="예: http://192.168.8.130:8001")
-    ap.add_argument("--config", default="processed/preprocess_config.json", help="NIDS 기준 상대경로")
-    ap.add_argument("--n", type=int, default=5, help="전송할 flow 개수")
-    ap.add_argument("--run-max-batches", type=int, default=5, help="모델에서 /ingest 실행 시 max_batches")
-    ap.add_argument("--drop-label", action="store_true", help="payload에 Label 있어도 제거")
+    ap.add_argument("--model-url", default="http://192.168.8.130:8001")
+    ap.add_argument("--config", default="processed/preprocess_config.json")
+    ap.add_argument("--n", type=int, default=10)
+    ap.add_argument("--run-max-batches", type=int, default=10)
+    ap.add_argument("--drop-label", action="store_true")
     ap.add_argument("--sport", type=int, default=80)
     ap.add_argument("--dport", type=int, default=12345)
     ap.add_argument("--proto", type=int, default=6)  # TCP=6, UDP=17
@@ -62,13 +68,9 @@ def main():
 
     cfg = load_config(config_path)
 
-    flows = []
+    flows: List[Dict[str, Any]] = []
     for i in range(args.n):
-        # 포트/프로토콜을 살짝 바꿔서 여러 케이스 보내고 싶으면 여기서 변형
-        sport = args.sport
-        dport = args.dport + i
-        proto = args.proto
-        flows.append(build_flow_from_config(cfg, sport=sport, dport=dport, proto=proto))
+        flows.append(build_flow(cfg, sport=args.sport, dport=args.dport + i, proto=args.proto))
 
     payload = {
         "flows": flows,
@@ -77,7 +79,7 @@ def main():
     }
 
     url = f"{args.model_url.rstrip('/')}/ingest"
-    r = requests.post(url, json=payload, timeout=60)
+    r = requests.post(url, json=payload, timeout=120)
     print("POST", url)
     print("status:", r.status_code)
     print(r.text)
