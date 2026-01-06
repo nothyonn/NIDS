@@ -1,39 +1,39 @@
 # src/engine/service.py
 from __future__ import annotations
 
-from dataclasses import dataclass
-from pathlib import Path
 import json
+import math
 import time
-from typing import Dict, Any, Optional, List
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+import pandas as pd
 import torch
-from torch.utils.data import DataLoader
-import requests
 
-from preprocess import FlowWindowDataset
 from TCN_Transformer import TCNTransformerModel
 from AutoEncoder import TCNAutoencoder
+
 from .fusion_model import compute_ae_scores
+from .online_preprocess import OnlinePreprocessor
+from .online_window import OnlineWindowBuffer, WindowItem
+from .hec_client import SplunkHECClient, SplunkHECConfig
 
 
-@dataclass
-class SplunkHECConfig:
-    url: str                 # e.g. "http://192.168.8.129:8088/services/collector"
-    token: str               # HEC token
-    index: str = "main"
-    sourcetype: str = "_json"
-    host: str = "model-server"
-    verify_tls: bool = False
-    timeout_sec: int = 3
+def _shannon_entropy(counts: np.ndarray) -> float:
+    total = counts.sum()
+    if total <= 0:
+        return 0.0
+    p = counts / total
+    p = p[p > 0]
+    return float(-(p * np.log2(p)).sum())
 
 
 class FusionService:
     """
-    - config/ckpt 로드 1회
-    - parquet 리플레이로 윈도잉/추론/퓨전 수행
-    - (옵션) Splunk HEC로 JSON 이벤트 전송
+    - (online) ingest(JSON flows) -> preprocess -> dst_ip windowing -> infer -> (opt) Splunk HEC
+    - (offline) replay(parquet) 는 별도 유지하고 싶으면 다른 모듈에서 돌려도 됨
+      (지금 파일은 online 중심)
     """
 
     def __init__(
@@ -44,20 +44,19 @@ class FusionService:
         ae_ckpt_rel: str = "models/ae_tcn_best.pt",
         seq_len: int = 128,
         stride: int = 64,
-        batch_size: int = 64,
         device: Optional[str] = None,
         ae_threshold: float = 1.5624,
         ae_agg_mode: str = "topk",
         ae_topk: int = 3,
+        max_buffer_per_dst: int = 5000,
     ):
         self.root_dir = Path(root_dir).resolve()
-        self.config_path = self.root_dir / config_rel
-        self.tcn_ckpt = self.root_dir / tcn_ckpt_rel
-        self.ae_ckpt = self.root_dir / ae_ckpt_rel
+        self.config_path = (self.root_dir / config_rel).resolve()
+        self.tcn_ckpt = (self.root_dir / tcn_ckpt_rel).resolve()
+        self.ae_ckpt = (self.root_dir / ae_ckpt_rel).resolve()
 
-        self.seq_len = seq_len
-        self.stride = stride
-        self.batch_size = batch_size
+        self.seq_len = int(seq_len)
+        self.stride = int(stride)
 
         self.ae_threshold = float(ae_threshold)
         self.ae_agg_mode = ae_agg_mode
@@ -74,16 +73,24 @@ class FusionService:
 
         self.numeric_cols = self.cfg["numeric_cols"]
         self.label_classes = self.cfg["label_classes"]
-
-        numeric_dim_base = len(self.numeric_cols)
-        window_feat_dim = 5
-        self.numeric_dim = numeric_dim_base + window_feat_dim
         self.num_classes = len(self.label_classes)
 
-        self.num_port_classes = self.cfg["other_port_idx"] + 1
-        self.num_proto_classes = self.cfg["proto_other_idx"] + 1
+        numeric_dim_base = len(self.numeric_cols)  # ex) 77
+        window_feat_dim = 5
+        self.numeric_dim = numeric_dim_base + window_feat_dim
 
-        # ---- load models (fusion_test.py와 동일 하이퍼파라미터) ----
+        self.num_port_classes = int(self.cfg["other_port_idx"]) + 1
+        self.num_proto_classes = int(self.cfg["proto_other_idx"]) + 1
+
+        # ---- online components ----
+        self.prep = OnlinePreprocessor(self.config_path)
+        self.winbuf = OnlineWindowBuffer(
+            seq_len=self.seq_len,
+            stride=self.stride,
+            max_buffer=max_buffer_per_dst,
+        )
+
+        # ---- models ----
         self.tcn_model = TCNTransformerModel(
             numeric_dim=self.numeric_dim,
             num_classes=self.num_classes,
@@ -98,9 +105,7 @@ class FusionService:
             dropout=0.1,
             max_len=self.seq_len + 1,
         ).to(self.device)
-
-        state_tcn = torch.load(self.tcn_ckpt, map_location=self.device)
-        self.tcn_model.load_state_dict(state_tcn)
+        self.tcn_model.load_state_dict(torch.load(self.tcn_ckpt, map_location=self.device))
         self.tcn_model.eval()
 
         self.ae_model = TCNAutoencoder(
@@ -112,198 +117,214 @@ class FusionService:
             tcn_num_layers=3,
             dropout=0.1,
         ).to(self.device)
-
-        state_ae = torch.load(self.ae_ckpt, map_location=self.device)
-        self.ae_model.load_state_dict(state_ae)
+        self.ae_model.load_state_dict(torch.load(self.ae_ckpt, map_location=self.device))
         self.ae_model.eval()
 
         print("[FusionService] ready")
-        print("  root_dir     :", self.root_dir)
-        print("  config_path  :", self.config_path)
-        print("  tcn_ckpt     :", self.tcn_ckpt)
-        print("  ae_ckpt      :", self.ae_ckpt)
-        print("  device       :", self.device)
+        print("  device        :", self.device)
         print("  seq_len/stride:", self.seq_len, self.stride)
-        print("  ae_threshold :", self.ae_threshold)
-        print("  label_classes:", self.label_classes)
 
     @torch.no_grad()
-    def infer_parquet_and_send(
+    def ingest_flows_and_send(
         self,
-        parquet_rel: str = "processed/flows_test_scaled.parquet",
-        parquet_path: Optional[str | Path] = None,  # ✅ 추가: 절대/상대 parquet 경로 직접 지정
-        splunk: Optional[SplunkHECConfig] = None,
-        max_batches: Optional[int] = 10,
-        sleep_sec: float = 0.0,
+        flows: List[Dict[str, Any]],
+        *,
+        splunk_cfg: Optional[SplunkHECConfig],
+        drop_label: bool = True,
+        force_flush: bool = False,
+        min_flush_len: int = 16,
+        max_windows: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
-        parquet를 FlowWindowDataset으로 윈도잉 → 배치 추론 → (옵션) Splunk HEC 전송
-
-        - parquet_path가 주어지면 그걸 우선 사용
-        - 아니면 root_dir/parquet_rel 사용
-
-        return: 요약 통계
+        flows(JSON list) -> preprocess -> buffer -> pop windows -> infer -> (opt) hec send
         """
-        if parquet_path is not None:
-            parquet_path_resolved = Path(parquet_path).expanduser().resolve()
-        else:
-            parquet_path_resolved = (self.root_dir / parquet_rel).resolve()
+        if not flows:
+            return {"ok": False, "error": "empty flows"}
 
-        if not parquet_path_resolved.exists():
-            raise FileNotFoundError(f"parquet not found: {parquet_path_resolved}")
+        # 1) preprocess (모델에서 처리)
+        rows = self.prep.transform(flows, drop_label=drop_label)
 
-        ds = FlowWindowDataset(
-            parquet_path=str(parquet_path_resolved),
-            config_path=str(self.config_path),
-            seq_len=self.seq_len,
-            stride=self.stride,
+        # 2) buffer add
+        self.winbuf.add_flows(rows)
+
+        # 3) pop windows (dst_ip 기준)
+        windows: List[WindowItem] = self.winbuf.pop_windows(
+            force_flush=force_flush,
+            min_flush_len=min_flush_len,
         )
+        if max_windows is not None:
+            windows = windows[:max_windows]
 
-        loader = DataLoader(
-            ds,
-            batch_size=self.batch_size,
-            shuffle=False,
-            num_workers=0,
-            pin_memory=(self.device.type == "cuda"),
-        )
+        hec = SplunkHECClient(splunk_cfg) if splunk_cfg is not None else None
 
-        total_windows = 0
+        popped_windows = 0
         sent_events = 0
-        tcn_pred_attack = 0
-        fusion_pred_attack = 0
+        tcn_attack_windows = 0
+        ae_attack_windows = 0
 
-        for b_idx, batch in enumerate(loader):
-            if max_batches is not None and b_idx >= max_batches:
-                break
+        events: List[Dict[str, Any]] = []
 
-            numeric, cat, mask, y = batch
-            numeric = numeric.to(self.device)
-            cat = cat.to(self.device)
-            mask = mask.to(self.device)
+        for w in windows:
+            numeric, cat, mask = self._build_window_tensors(w)
 
-            # --- TCN ---
-            logits = self.tcn_model(numeric, cat, mask)   # [B, C]
-            probs = torch.sigmoid(logits)
-            preds = (probs >= 0.5).bool()                 # [B, C]
-            pred_attack_any = preds[:, 1:].any(dim=1)      # [B]
+            # ---- TCN ----
+            logits = self.tcn_model(numeric, cat, mask)   # [1, C]
+            probs = torch.sigmoid(logits)[0]              # [C]
+            preds = (probs >= 0.5)                        # [C]
 
-            # --- AE (TCN이 놓친 것만) ---
-            idx_missed = torch.nonzero(~pred_attack_any, as_tuple=True)[0]  # [N_missed]
+            tcn_attack_classes = [
+                self.label_classes[j]
+                for j in range(1, self.num_classes)
+                if bool(preds[j].item())
+            ]
+            tcn_attack_any = len(tcn_attack_classes) > 0
 
-            ae_recovered_mask = torch.zeros_like(pred_attack_any)
-            ae_scores_all = torch.full((pred_attack_any.shape[0],), float("nan"), device=self.device)
+            # ---- AE (TCN benign일 때만) ----
+            ae_used = False
+            ae_score = None
+            ae_attack = False
 
-            if idx_missed.numel() > 0:
-                recon = self.ae_model(numeric[idx_missed], cat[idx_missed], mask[idx_missed])  # [N, L, F]
+            if not tcn_attack_any:
+                recon = self.ae_model(numeric, cat, mask)  # [1, L, F]
                 scores = compute_ae_scores(
                     recon=recon,
-                    target=numeric[idx_missed],
-                    mask=mask[idx_missed],
+                    target=numeric,
+                    mask=mask,
                     agg_mode=self.ae_agg_mode,
                     topk=self.ae_topk,
-                )  # [N]
-                ae_anom = scores >= self.ae_threshold
-                ae_recovered_mask[idx_missed] = ae_anom
-                ae_scores_all[idx_missed] = scores
+                )
+                ae_score = float(scores[0].item())
+                ae_used = True
+                ae_attack = ae_score >= self.ae_threshold
 
-            fusion_attack_any = pred_attack_any | ae_recovered_mask
-
-            # ---- stats ----
-            B = numeric.shape[0]
-            total_windows += B
-            tcn_pred_attack += int(pred_attack_any.sum().item())
-            fusion_pred_attack += int(fusion_attack_any.sum().item())
-
-            # ---- send to Splunk ----
-            if splunk is not None:
-                payloads = []
-                for i in range(B):
-                    # ---- decision 생성 ----
-                    tcn_attack_classes = [
-                        self.label_classes[j]
+            # ---- decision ----
+            if tcn_attack_any:
+                decision = {
+                    "source": "TCN",
+                    "attack": True,
+                    "attack_types": tcn_attack_classes,
+                    "confidence": {
+                        self.label_classes[j]: float(probs[j].item())
                         for j in range(1, self.num_classes)
-                        if preds[i, j]
-                    ]
+                        if bool(preds[j].item())
+                    },
+                }
+                tcn_attack_windows += 1
 
-                    if tcn_attack_classes:
-                        decision = {
-                            "source": "TCN",
-                            "attack": True,
-                            "attack_types": tcn_attack_classes,
-                            "confidence": {
-                                self.label_classes[j]: float(probs[i, j].item())
-                                for j in range(1, self.num_classes)
-                                if preds[i, j]
-                            },
-                        }
+            elif ae_attack:
+                decision = {
+                    "source": "AE",
+                    "attack": True,
+                    "attack_types": ["ANOMALY"],
+                    "ae_score": ae_score,
+                    "ae_threshold": self.ae_threshold,
+                    "agg_mode": self.ae_agg_mode,
+                    "topk": self.ae_topk,
+                }
+                ae_attack_windows += 1
 
-                    elif ae_recovered_mask[i]:
-                        decision = {
-                            "source": "AE",
-                            "attack": True,
-                            "attack_types": ["ANOMALY"],
-                            "ae_score": float(ae_scores_all[i].item()),
-                            "ae_threshold": self.ae_threshold,
-                        }
+            else:
+                decision = {"source": "NONE", "attack": False, "attack_types": []}
 
-                    else:
-                        decision = {
-                            "source": "NONE",
-                            "attack": False,
-                            "attack_types": [],
-                        }
+            event = {
+                "dst_ip": w.dst_ip,
+                "real_len": int(w.real_len),
+                "decision": decision,
+                "meta": {
+                    "seq_len": self.seq_len,
+                    "stride": self.stride,
+                    "ae_used": ae_used,
+                    "ts": time.time(),
+                },
+            }
+            events.append(event)
+            popped_windows += 1
 
-                    event = {
-                        "window_id": f"b{b_idx}_i{i}",
-                        "decision": decision,
-                        "meta": {
-                            "seq_len": self.seq_len,
-                            "stride": self.stride,
-                        },
-                    }
-
-                    payloads.append({
-                        "event": event,
-                        "host": splunk.host,
-                        "sourcetype": splunk.sourcetype,
-                        "index": splunk.index,
-                        "time": time.time(),
-                    })
-
-                sent = self._send_hec_batch(splunk, payloads)
-                sent_events += sent
-
-            if sleep_sec > 0:
-                time.sleep(sleep_sec)
-
-            print(f"[batch {b_idx}] windows={B} tcn_attack={int(pred_attack_any.sum())} fusion_attack={int(fusion_attack_any.sum())} sent={sent_events}")
+        if hec is not None and events:
+            sent_events = hec.send_events(events)
 
         return {
-            "total_windows": total_windows,
-            "tcn_pred_attack_windows": tcn_pred_attack,
-            "fusion_pred_attack_windows": fusion_pred_attack,
+            "ok": True,
+            "input_flows": len(flows),
+            "popped_windows": popped_windows,
+            "tcn_attack_windows": tcn_attack_windows,
+            "ae_attack_windows": ae_attack_windows,
             "sent_events": sent_events,
-            "max_batches": max_batches,
-            "parquet_used": str(parquet_path_resolved),
         }
 
-    def _send_hec_batch(self, splunk: SplunkHECConfig, payloads: List[Dict[str, Any]]) -> int:
-        headers = {
-            "Authorization": f"Splunk {splunk.token}",
-            "Content-Type": "application/json",
-        }
-        ok = 0
-        for p in payloads:
-            try:
-                r = requests.post(
-                    splunk.url,
-                    headers=headers,
-                    json=p,
-                    timeout=splunk.timeout_sec,
-                    verify=splunk.verify_tls,
-                )
-                if 200 <= r.status_code < 300:
-                    ok += 1
-            except Exception:
-                pass
-        return ok
+    def _build_window_tensors(self, w: WindowItem) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        WindowItem(rows, real_len) -> (numeric, cat, mask)
+        numeric: [1, L, 77+5]
+        cat   : [1, L, 3]  (sport_idx, dport_idx, proto_idx)
+        mask  : [1, L]
+        """
+        rows = w.rows
+        real_len = int(w.real_len)
+        L = self.seq_len
+
+        # base numeric [real_len, 77]
+        base = np.zeros((real_len, len(self.numeric_cols)), dtype=np.float32)
+        for i, r in enumerate(rows):
+            for j, c in enumerate(self.numeric_cols):
+                base[i, j] = float(r.get(c, 0.0))
+
+        # ----- window-level features (5) -----
+        total_flows = float(real_len)
+
+        src_vals = [r.get("Source IP") for r in rows if r.get("Source IP") is not None]
+        if src_vals:
+            vc = pd.Series(src_vals).value_counts()
+            unique_src = float(len(vc))
+            counts = vc.to_numpy(dtype=np.float32)
+        else:
+            unique_src = 1.0
+            counts = np.array([], dtype=np.float32)
+
+        avg_flows_per_src = total_flows / unique_src if unique_src > 0 else 0.0
+        src_ent_raw = _shannon_entropy(counts) if unique_src > 0 and len(counts) > 0 else 0.0
+
+        ts_list = [r.get("Timestamp") for r in rows if r.get("Timestamp") is not None]
+        if ts_list:
+            t_min = min(ts_list)
+            t_max = max(ts_list)
+            window_duration = float(max((t_max - t_min).total_seconds(), 1e-6))
+        else:
+            window_duration = 1e-6
+
+        flow_rate = total_flows / window_duration
+
+        f1 = np.log1p(unique_src) / 5.0
+        f2 = np.log1p(avg_flows_per_src) / 5.0
+        if unique_src > 1:
+            max_ent = math.log2(unique_src)
+            f3 = float(np.clip(src_ent_raw / (max_ent + 1e-12), 0.0, 1.0))
+        else:
+            f3 = 0.0
+        f4 = np.log1p(window_duration) / 10.0
+        f5 = np.log1p(flow_rate) / 5.0
+
+        win_feat = np.array([f1, f2, f3, f4, f5], dtype=np.float32)
+        win_feat_real = np.repeat(win_feat[None, :], real_len, axis=0)  # [real_len,5]
+        numeric_real = np.concatenate([base, win_feat_real], axis=1)    # [real_len,82]
+
+        # pad numeric to [L, 82]
+        numeric = np.zeros((L, numeric_real.shape[1]), dtype=np.float32)
+        numeric[:real_len] = numeric_real
+
+        # categorical [L,3]
+        cat = np.zeros((L, 3), dtype=np.int64)
+        for i, r in enumerate(rows):
+            cat[i, 0] = int(r.get("sport_idx", 0))
+            cat[i, 1] = int(r.get("dport_idx", 0))
+            cat[i, 2] = int(r.get("proto_idx", 0))
+
+        # mask [L]
+        mask = np.zeros((L,), dtype=np.float32)
+        mask[:real_len] = 1.0
+
+        numeric_t = torch.tensor(numeric[None, :, :], dtype=torch.float32, device=self.device)
+        cat_t = torch.tensor(cat[None, :, :], dtype=torch.int64, device=self.device)
+        mask_t = torch.tensor(mask[None, :], dtype=torch.float32, device=self.device)
+
+        return numeric_t, cat_t, mask_t

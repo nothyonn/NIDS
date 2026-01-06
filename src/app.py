@@ -3,20 +3,21 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import Any, Dict, List
 
-import pandas as pd
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-from engine.service import FusionService, SplunkHECConfig
+from engine.service import FusionService
+from engine.hec_client import SplunkHECConfig
 
 app = FastAPI()
 
 ROOT_DIR = Path(__file__).resolve().parents[1]  # NIDS 루트
 
-SPLUNK_HEC_URL = os.getenv("SPLUNK_HEC_URL", "http://192.168.8.129:8088/services/collector")
-SPLUNK_HEC_TOKEN = os.getenv("SPLUNK_HEC_TOKEN", "")
+# 너가 하드코딩 하든 env 쓰든 여기만 맞으면 됨
+SPLUNK_HEC_URL = os.getenv("SPLUNK_HEC_URL", "https://192.168.8.129:8088/services/collector")
+SPLUNK_HEC_TOKEN = os.getenv("SPLUNK_HEC_TOKEN", "<토큰>")
 SPLUNK_INDEX = os.getenv("SPLUNK_INDEX", "main")
 
 svc = FusionService(
@@ -26,69 +27,42 @@ svc = FusionService(
     ae_ckpt_rel="models/ae_tcn_best.pt",
     seq_len=128,
     stride=64,
-    batch_size=64,
     ae_threshold=1.5624,
     ae_agg_mode="topk",
     ae_topk=3,
 )
 
-class ReplayReq(BaseModel):
-    parquet_rel: str = "processed/flows_test_scaled.parquet"
-    max_batches: int = 10
-    sleep_sec: float = 0.0
-
 class IngestReq(BaseModel):
     flows: List[Dict[str, Any]]
-    run_max_batches: int = 10
-    drop_label: bool = False
+    drop_label: bool = True
+    force_flush: bool = False
+    min_flush_len: int = 16
+    max_windows: int | None = None
 
 @app.get("/health")
 def health():
     return {"ok": True}
 
-def _make_splunk():
-    return SplunkHECConfig(
+@app.post("/ingest")
+def ingest(req: IngestReq):
+    if not SPLUNK_HEC_TOKEN:
+        return {"ok": False, "error": "SPLUNK_HEC_TOKEN is empty"}
+
+    splunk_cfg = SplunkHECConfig(
         url=SPLUNK_HEC_URL,
         token=SPLUNK_HEC_TOKEN,
         index=SPLUNK_INDEX,
         sourcetype="_json",
         host="model-server",
         verify_tls=False,
-        timeout_sec=3,
+        timeout_sec=5,
     )
 
-@app.post("/replay")
-def replay(req: ReplayReq):
-    if not SPLUNK_HEC_TOKEN:
-        return {"ok": False, "error": "SPLUNK_HEC_TOKEN env var is empty."}
-
-    summary = svc.infer_parquet_and_send(
-        parquet_rel=req.parquet_rel,
-        splunk=_make_splunk(),
-        max_batches=req.max_batches,
-        sleep_sec=req.sleep_sec,
+    return svc.ingest_flows_and_send(
+        flows=req.flows,
+        splunk_cfg=splunk_cfg,
+        drop_label=req.drop_label,
+        force_flush=req.force_flush,
+        min_flush_len=req.min_flush_len,
+        max_windows=req.max_windows,
     )
-    return {"ok": True, "summary": summary}
-
-@app.post("/ingest")
-def ingest(req: IngestReq):
-    if not SPLUNK_HEC_TOKEN:
-        return {"ok": False, "error": "SPLUNK_HEC_TOKEN env var is empty."}
-
-    if not req.flows:
-        return {"ok": False, "msg": "empty flows"}
-
-    df = pd.DataFrame(req.flows)
-    if req.drop_label and "Label" in df.columns:
-        df = df.drop(columns=["Label"])
-
-    tmp_path = Path("/tmp/ingest_live.parquet")
-    df.to_parquet(tmp_path, index=False)
-
-    summary = svc.infer_parquet_and_send(
-        parquet_path=str(tmp_path),     # service.py에서 지원해야 함
-        splunk=_make_splunk(),
-        max_batches=req.run_max_batches,
-        sleep_sec=0.0,
-    )
-    return {"ok": True, "summary": summary, "tmp_parquet": str(tmp_path)}
