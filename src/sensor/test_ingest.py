@@ -83,7 +83,7 @@ def build_one_flow(
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model-url", default="http://192.168.8.130:8001")
+    ap.add_argument("--model-url", default="http://192.168.0.10:8001")
     ap.add_argument("--config", default="processed/preprocess_config.json")
     ap.add_argument("--n", type=int, default=200, help="전송할 flow 개수")
     ap.add_argument("--run-max-batches", type=int, default=10)
