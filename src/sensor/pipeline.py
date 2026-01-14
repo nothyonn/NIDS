@@ -7,13 +7,14 @@ import os
 import shutil
 import subprocess
 import time
+from collections import deque
 from pathlib import Path
-from typing import Dict, List, Set, Optional
+from typing import Dict, List, Set
 
 import requests
 
 
-def stable_file(path: Path, wait_sec: float = 1.0) -> bool:
+def stable_file(path: Path, wait_sec: float = 2.0) -> bool:
     """파일 크기가 wait_sec 동안 변하지 않으면 닫힌 것으로 간주."""
     try:
         s1 = path.stat().st_size
@@ -77,8 +78,8 @@ def run_cicflowmeter_v3_for_one_pcap(
         "-cp",
         str(cic_jar),
         "cic.cs.unb.ca.ifm.CICFlowMeter",
-        str(work_in_dir) + "/",  # ★ trailing slash 중요
-        str(out_dir) + "/",      # ★ trailing slash 중요
+        str(work_in_dir) + "/",  # trailing slash 중요
+        str(out_dir) + "/",      # trailing slash 중요
     ]
 
     env = os.environ.copy()
@@ -94,8 +95,9 @@ def run_cicflowmeter_v3_for_one_pcap(
     return new_csvs
 
 
-def chunked(lst: List[Dict], n: int) -> List[List[Dict]]:
-    return [lst[i:i+n] for i in range(0, len(lst), n)]
+def chunked(lst: List[Dict], n: int):
+    for i in range(0, len(lst), n):
+        yield lst[i:i+n]
 
 
 def main():
@@ -119,15 +121,18 @@ def main():
     # pipeline behavior
     ap.add_argument("--pcap-glob", default="*.pcap")
     ap.add_argument("--poll-sec", type=float, default=1.0)
+    ap.add_argument("--stable-wait-sec", type=float, default=2.0, help="pcap 파일 닫힘 판단 대기(권장 2.0)")
 
     # micro-batch
-    ap.add_argument("--batch-rows", type=int, default=512, help="ingest로 묶어서 보낼 flow 수(권장 256~2000)")
-    ap.add_argument("--max-request-rows", type=int, default=2000, help="1회 요청 body 최대 flow 수(너무 크면 413/지연)")
-    ap.add_argument("--flush-interval", type=float, default=2.0, help="batch_rows 못 채워도 이 시간마다 전송 시도")
+    ap.add_argument("--batch-rows", type=int, default=256, help="size flush 기준 (권장 256)")
+    ap.add_argument("--max-request-rows", type=int, default=2000, help="1회 요청 body 최대 flow 수")
+    ap.add_argument("--flush-interval", type=float, default=2.0, help="time flush 기준 (권장 2.0)")
     ap.add_argument("--keep-csv", action="store_true", help="csv 파일을 /data/flows에 남김(디버깅용)")
     ap.add_argument("--keep-pcap", action="store_true", help="pcap 파일을 archive로 옮기지 않고 남김(비권장)")
     ap.add_argument("--once", action="store_true", help="현재 pcap들 처리하고 종료")
 
+    # safety
+    ap.add_argument("--seen-max", type=int, default=5000, help="seen 목록 최대 크기(무한 증가 방지)")
     args = ap.parse_args()
 
     pcap_dir = Path(args.pcap_dir)
@@ -151,7 +156,19 @@ def main():
     if not jnet_dir.exists():
         raise FileNotFoundError(f"jnetpcap dir not found: {jnet_dir}")
 
-    seen: Set[str] = set()
+    # seen을 무한히 키우지 않기 위해 deque+set 조합
+    seen_q = deque(maxlen=int(args.seen_max))
+    seen_s: Set[str] = set()
+
+    def mark_seen(name: str):
+        if name in seen_s:
+            return
+        if len(seen_q) == seen_q.maxlen:
+            old = seen_q.popleft()
+            seen_s.discard(old)
+        seen_q.append(name)
+        seen_s.add(name)
+
     buffer: List[Dict] = []
     last_flush = time.time()
 
@@ -167,16 +184,17 @@ def main():
     log(f"cic_jar={cic_jar}")
     log(f"model_url={args.model_url}")
     log(f"batch_rows={args.batch_rows} flush_interval={args.flush_interval}s max_request_rows={args.max_request_rows}")
+    log(f"poll_sec={args.poll_sec} stable_wait_sec={args.stable_wait_sec}")
 
     while True:
         pcaps = sorted(pcap_dir.glob(args.pcap_glob))
 
         for pcap in pcaps:
-            if pcap.name in seen:
+            if pcap.name in seen_s:
                 continue
 
             # 아직 쓰는 중이면 skip
-            if not stable_file(pcap, wait_sec=1.0):
+            if not stable_file(pcap, wait_sec=float(args.stable_wait_sec)):
                 continue
 
             # pcap -> csv
@@ -192,7 +210,7 @@ def main():
                 log(f"cicflowmeter ok: {pcap.name} -> new_csvs={len(new_csvs)}")
             except Exception as e:
                 log(f"cicflowmeter FAIL: {pcap.name} err={e}")
-                seen.add(pcap.name)
+                mark_seen(pcap.name)
                 continue
 
             # csv 읽어서 buffer 누적
@@ -218,20 +236,30 @@ def main():
                 except Exception:
                     pass
 
-            seen.add(pcap.name)
+            mark_seen(pcap.name)
 
-        # ---- flush logic ----
+        # ---- flush logic 개선 ----
         now = time.time()
         should_flush_by_time = (now - last_flush) >= float(args.flush_interval)
         should_flush_by_size = len(buffer) >= int(args.batch_rows)
 
         if buffer and (should_flush_by_size or should_flush_by_time):
-            # 1회 요청이 너무 커지지 않게 max_request_rows로 잘라서 전송
-            send_now = buffer[: int(args.max_request_rows)]
+            # 이번 flush에서 보낼 최대량 (너무 커지면 지연/413 위험)
+            send_cap = int(args.max_request_rows)
+            send_now = buffer[:send_cap]
             buffer = buffer[len(send_now):]
 
-            # 이 send_now도 다시 batch_rows 단위로 여러 번 나눠서 보내면 더 안정적
-            for part in chunked(send_now, int(args.batch_rows)):
+            # 1) size flush: 안정적으로 batch_rows로 쪼개서 여러 번 전송
+            # 2) time flush: 실시간성을 위해 "남은 것까지" 전송 (batch_rows에 안 맞아도 보냄)
+            if should_flush_by_size and not should_flush_by_time:
+                parts = list(chunked(send_now, int(args.batch_rows)))
+            else:
+                # time flush면 통째로 보내되, send_cap은 이미 적용됨
+                parts = [send_now]
+
+            for part in parts:
+                if not part:
+                    continue
                 try:
                     r = post_ingest(args.model_url, part, timeout_sec=180)
                     log(f"ingest ok: sent={len(part)} status={r.status_code} body={r.text[:200]}")

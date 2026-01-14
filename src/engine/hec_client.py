@@ -10,7 +10,7 @@ import requests
 
 @dataclass
 class SplunkHECConfig:
-    url: str                 # e.g. "https://192.168.8.129:8088/services/collector"
+    url: str                 # e.g. "https://192.168.111.20:8088/services/collector"
     token: str               # HEC token
     index: str = "main"
     sourcetype: str = "_json"
