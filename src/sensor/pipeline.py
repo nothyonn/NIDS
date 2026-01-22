@@ -3,13 +3,16 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import os
+import re
 import shutil
 import subprocess
 import time
+import uuid
 from collections import deque
 from pathlib import Path
-from typing import Dict, List, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 import requests
 
@@ -25,23 +28,102 @@ def stable_file(path: Path, wait_sec: float = 2.0) -> bool:
         return False
 
 
-def read_csv_rows(csv_path: Path) -> List[Dict]:
-    """CICFlowMeter CSV를 row dict 리스트로 읽음(헤더 기반)."""
+def _norm_col(c: str) -> str:
+    if c is None:
+        return ""
+    c = str(c).replace("\ufeff", "").strip()
+    c = re.sub(r"\s+", " ", c)  # 연속 공백 정리
+    return c
+
+
+def _sha256_text(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _disambiguate_header_like_pandas(raw_header: List[str]) -> List[str]:
+    """
+    ⚠️ 중요:
+    - DictReader는 중복 헤더를 dict 키로 만들 때 덮어써서 feature가 사라질 수 있음.
+    - pandas는 중복 헤더를 .1, .2 ... 로 살려둠.
+    => 센서도 pandas 방식으로 중복 헤더를 보존해서 학습 스키마와 동일하게 맞춤.
+    """
+    seen: Dict[str, int] = {}
+    out: List[str] = []
+    for c in raw_header:
+        c = _norm_col(c)
+        if c not in seen:
+            seen[c] = 0
+            out.append(c)
+        else:
+            seen[c] += 1
+            out.append(f"{c}.{seen[c]}")
+    return out
+
+
+def read_csv_rows(csv_path: Path) -> Tuple[List[Dict], List[str], str, List[str]]:
+    """
+    CICFlowMeter CSV를 row dict 리스트로 읽음(헤더 기반).
+    returns: (rows, header_cols, header_hash, dup_bases)
+    """
     rows: List[Dict] = []
     with csv_path.open("r", encoding="utf-8", errors="ignore", newline="") as f:
         reader = csv.DictReader(f)
+        raw_header = reader.fieldnames or []
+        header = _disambiguate_header_like_pandas(list(raw_header))
+
+        dup_bases = sorted({c.rsplit(".", 1)[0] for c in header if re.search(r"\.\d+$", c)})
+
+        # DictReader가 이 header를 사용하도록 강제
+        reader.fieldnames = header
+
         for r in reader:
-            rr = {(k.strip() if k else k): (v.strip() if isinstance(v, str) else v) for k, v in r.items()}
+            rr = {(_norm_col(k) if k else k): (v.strip() if isinstance(v, str) else v) for k, v in r.items()}
             rows.append(rr)
-    return rows
+
+    header_hash = _sha256_text("\n".join(header))[:16]
+    return rows, header, header_hash, dup_bases
 
 
-def post_ingest(model_url: str, flows: List[Dict], timeout_sec: int = 180) -> requests.Response:
+def fetch_model_schema(model_url: str, timeout_sec: float = 3.0) -> Optional[Dict]:
+    try:
+        url = f"{model_url.rstrip('/')}/schema"
+        r = requests.get(url, timeout=timeout_sec)
+        if r.status_code != 200:
+            return None
+        return r.json()
+    except Exception:
+        return None
+
+
+def schema_compare(header_cols: List[str], schema: Dict) -> Dict[str, object]:
+    numeric_cols = schema.get("numeric_cols") or []
+    norm_header = {_norm_col(c) for c in header_cols}
+    norm_numeric = {_norm_col(c) for c in numeric_cols}
+
+    inter = norm_header & norm_numeric
+    missing = sorted(list(norm_numeric - norm_header))
+    cov = (len(inter) / len(norm_numeric)) if norm_numeric else 0.0
+
+    return {
+        "coverage": float(cov),
+        "missing_n": int(len(missing)),
+        "missing_top": missing[:20],
+        "schema_id": schema.get("schema_id") or (schema.get("config_sha256", "")[:12]),
+    }
+
+
+def post_ingest(
+    model_url: str,
+    flows: List[Dict],
+    *,
+    request_id: str,
+    timeout_sec: int = 180,
+) -> requests.Response:
     url = f"{model_url.rstrip('/')}/ingest"
     payload = {
         "flows": flows,
-        "run_max_batches": 999999,  # 모델이 알아서 윈도잉/추론
-        "drop_label": True,         # live flow엔 Label 없으니 드랍
+        "request_id": request_id,
+        "drop_label": True,  # live flow엔 Label 없으니 드랍
     }
     return requests.post(url, json=payload, timeout=timeout_sec)
 
@@ -55,15 +137,10 @@ def run_cicflowmeter_v3_for_one_pcap(
     work_in_dir: Path,
     log_path: Path,
 ) -> List[Path]:
-    """
-    CICFlowMeter V3는 "pcap 디렉터리"를 입력으로 받음.
-    파일 1개만 처리하려면 work_in_dir에 그 파일만 넣고 돌리는 게 가장 안전.
-    """
     out_dir.mkdir(parents=True, exist_ok=True)
     work_in_dir.mkdir(parents=True, exist_ok=True)
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # work dir 정리 -> 파일 1개만 투입
     for x in work_in_dir.glob("*.pcap"):
         x.unlink(missing_ok=True)
 
@@ -97,7 +174,7 @@ def run_cicflowmeter_v3_for_one_pcap(
 
 def chunked(lst: List[Dict], n: int):
     for i in range(0, len(lst), n):
-        yield lst[i:i+n]
+        yield lst[i : i + n]
 
 
 def main():
@@ -117,22 +194,24 @@ def main():
 
     # model
     ap.add_argument("--model-url", required=True)
+    ap.add_argument("--schema-check", action="store_true", default=True, help="model /schema로 스키마 비교 로그(기본 ON)")
+    ap.add_argument("--schema-timeout", type=float, default=3.0)
 
     # pipeline behavior
     ap.add_argument("--pcap-glob", default="*.pcap")
     ap.add_argument("--poll-sec", type=float, default=1.0)
-    ap.add_argument("--stable-wait-sec", type=float, default=2.0, help="pcap 파일 닫힘 판단 대기(권장 2.0)")
+    ap.add_argument("--stable-wait-sec", type=float, default=2.0)
 
     # micro-batch
-    ap.add_argument("--batch-rows", type=int, default=256, help="size flush 기준 (권장 256)")
-    ap.add_argument("--max-request-rows", type=int, default=2000, help="1회 요청 body 최대 flow 수")
-    ap.add_argument("--flush-interval", type=float, default=2.0, help="time flush 기준 (권장 2.0)")
-    ap.add_argument("--keep-csv", action="store_true", help="csv 파일을 /data/flows에 남김(디버깅용)")
-    ap.add_argument("--keep-pcap", action="store_true", help="pcap 파일을 archive로 옮기지 않고 남김(비권장)")
-    ap.add_argument("--once", action="store_true", help="현재 pcap들 처리하고 종료")
+    ap.add_argument("--batch-rows", type=int, default=256)
+    ap.add_argument("--max-request-rows", type=int, default=2000)
+    ap.add_argument("--flush-interval", type=float, default=2.0)
+    ap.add_argument("--keep-csv", action="store_true")
+    ap.add_argument("--keep-pcap", action="store_true")
+    ap.add_argument("--once", action="store_true")
 
     # safety
-    ap.add_argument("--seen-max", type=int, default=5000, help="seen 목록 최대 크기(무한 증가 방지)")
+    ap.add_argument("--seen-max", type=int, default=5000)
     args = ap.parse_args()
 
     pcap_dir = Path(args.pcap_dir)
@@ -156,7 +235,6 @@ def main():
     if not jnet_dir.exists():
         raise FileNotFoundError(f"jnetpcap dir not found: {jnet_dir}")
 
-    # seen을 무한히 키우지 않기 위해 deque+set 조합
     seen_q = deque(maxlen=int(args.seen_max))
     seen_s: Set[str] = set()
 
@@ -172,6 +250,22 @@ def main():
     buffer: List[Dict] = []
     last_flush = time.time()
 
+    # schema cache
+    schema_cache: Optional[Dict] = None
+    schema_cache_ts: float = 0.0
+    schema_ttl = 60.0
+
+    def get_schema_cached() -> Optional[Dict]:
+        nonlocal schema_cache, schema_cache_ts
+        if not args.schema_check:
+            return None
+        now = time.time()
+        if schema_cache is not None and (now - schema_cache_ts) < schema_ttl:
+            return schema_cache
+        schema_cache = fetch_model_schema(args.model_url, timeout_sec=float(args.schema_timeout))
+        schema_cache_ts = now
+        return schema_cache
+
     def log(msg: str) -> None:
         ts = time.strftime("%F %T")
         line = f"[{ts}] {msg}"
@@ -185,6 +279,7 @@ def main():
     log(f"model_url={args.model_url}")
     log(f"batch_rows={args.batch_rows} flush_interval={args.flush_interval}s max_request_rows={args.max_request_rows}")
     log(f"poll_sec={args.poll_sec} stable_wait_sec={args.stable_wait_sec}")
+    log(f"schema_check={bool(args.schema_check)} schema_timeout={args.schema_timeout}s")
 
     while True:
         pcaps = sorted(pcap_dir.glob(args.pcap_glob))
@@ -193,11 +288,9 @@ def main():
             if pcap.name in seen_s:
                 continue
 
-            # 아직 쓰는 중이면 skip
             if not stable_file(pcap, wait_sec=float(args.stable_wait_sec)):
                 continue
 
-            # pcap -> csv
             try:
                 new_csvs = run_cicflowmeter_v3_for_one_pcap(
                     cic_jar=cic_jar,
@@ -213,23 +306,51 @@ def main():
                 mark_seen(pcap.name)
                 continue
 
-            # csv 읽어서 buffer 누적
+            schema = get_schema_cached()
+
             for csv_path in new_csvs:
                 try:
-                    rows = read_csv_rows(csv_path)
+                    rows, header_cols, header_hash, dup_bases = read_csv_rows(csv_path)
+
+                    if schema:
+                        cmp = schema_compare(header_cols, schema)
+                        log(
+                            f"schema_check: pcap={pcap.name} csv={csv_path.name} "
+                            f"header_hash={header_hash} cov={cmp['coverage']:.3f} "
+                            f"missing_n={cmp['missing_n']} schema_id={cmp['schema_id']} "
+                            f"dup_bases={len(dup_bases)}"
+                        )
+                        if cmp["missing_n"]:
+                            log(f"schema_missing_top: {cmp['missing_top']}")
+                        for r in rows:
+                            r["_debug_schema_cov"] = float(cmp["coverage"])
+                            r["_debug_schema_missing_n"] = int(cmp["missing_n"])
+                            r["_debug_schema_id"] = str(cmp["schema_id"])
+                    else:
+                        log(
+                            f"schema_check: pcap={pcap.name} csv={csv_path.name} "
+                            f"header_hash={header_hash} schema=NONE dup_bases={len(dup_bases)}"
+                        )
+
+                    now_ts = time.time()
+                    for r in rows:
+                        r["_debug_pcap"] = pcap.name
+                        r["_debug_csv"] = csv_path.name
+                        r["_debug_header_hash"] = header_hash
+                        r["_debug_sensor_ts"] = now_ts
+
                     buffer.extend(rows)
                     log(f"csv read: {csv_path.name} rows={len(rows)} buffer={len(buffer)}")
+
                 except Exception as e:
                     log(f"csv read FAIL: {csv_path.name} err={e}")
 
-                # csv 유지/삭제
                 if not args.keep_csv:
                     try:
                         csv_path.unlink(missing_ok=True)
                     except Exception:
                         pass
 
-            # pcap 이동/유지
             if not args.keep_pcap:
                 try:
                     shutil.move(str(pcap), str(archive_dir / pcap.name))
@@ -238,48 +359,50 @@ def main():
 
             mark_seen(pcap.name)
 
-        # ---- flush logic 개선 ----
         now = time.time()
         should_flush_by_time = (now - last_flush) >= float(args.flush_interval)
         should_flush_by_size = len(buffer) >= int(args.batch_rows)
 
         if buffer and (should_flush_by_size or should_flush_by_time):
-            # 이번 flush에서 보낼 최대량 (너무 커지면 지연/413 위험)
             send_cap = int(args.max_request_rows)
             send_now = buffer[:send_cap]
-            buffer = buffer[len(send_now):]
+            buffer = buffer[len(send_now) :]
 
-            # 1) size flush: 안정적으로 batch_rows로 쪼개서 여러 번 전송
-            # 2) time flush: 실시간성을 위해 "남은 것까지" 전송 (batch_rows에 안 맞아도 보냄)
             if should_flush_by_size and not should_flush_by_time:
                 parts = list(chunked(send_now, int(args.batch_rows)))
             else:
-                # time flush면 통째로 보내되, send_cap은 이미 적용됨
                 parts = [send_now]
+
+            request_id = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
 
             for part in parts:
                 if not part:
                     continue
+                # HTTP 요청 단위 request_id를 모든 flow에 동일하게 박아서 모델/스플렁크/로그 연결
+                for r in part:
+                    r["_debug_request_id"] = request_id
+
                 try:
-                    r = post_ingest(args.model_url, part, timeout_sec=180)
-                    log(f"ingest ok: sent={len(part)} status={r.status_code} body={r.text[:200]}")
+                    r = post_ingest(args.model_url, part, request_id=request_id, timeout_sec=180)
+                    log(f"ingest ok: req_id={request_id} sent={len(part)} status={r.status_code} body={r.text[:200]}")
                 except Exception as e:
-                    # 실패 시 복구: part를 앞에 다시 붙임
                     buffer = part + buffer
-                    log(f"ingest FAIL: err={e} (requeued {len(part)})")
+                    log(f"ingest FAIL: req_id={request_id} err={e} (requeued {len(part)})")
                     time.sleep(2.0)
                     break
 
             last_flush = now
 
         if args.once:
-            # 남은 buffer도 한번 더 flush 시도하고 종료
             if buffer:
+                request_id = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
+                for r in buffer:
+                    r["_debug_request_id"] = request_id
                 try:
-                    r = post_ingest(args.model_url, buffer, timeout_sec=180)
-                    log(f"final flush ok: sent={len(buffer)} status={r.status_code} body={r.text[:200]}")
+                    r = post_ingest(args.model_url, buffer, request_id=request_id, timeout_sec=180)
+                    log(f"final flush ok: req_id={request_id} sent={len(buffer)} status={r.status_code} body={r.text[:200]}")
                 except Exception as e:
-                    log(f"final flush FAIL: err={e}")
+                    log(f"final flush FAIL: req_id={request_id} err={e}")
             log("once mode done. exit.")
             return
 
