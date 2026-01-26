@@ -9,6 +9,77 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 
 
+# ---------------------------
+# ★ 추가: 컬럼 rename / drop 규칙
+# ---------------------------
+RENAME_MAP: Dict[str, str] = {
+    # IP/Port (CICFlowMeter V3 헤더 ↔ 학습 헤더)
+    "Src IP": "Source IP",
+    "Dst IP": "Destination IP",
+    "Src Port": "Source Port",
+    "Dst Port": "Destination Port",
+
+    # packet count / length (자주 틀어지는 것들)
+    "Total Fwd Packet": "Total Fwd Packets",
+    "Total Fwd Packet(s)": "Total Fwd Packets",
+    "Total Bwd packets": "Total Backward Packets",
+    "Total Bwd Packets": "Total Backward Packets",
+
+    "Total Length of Fwd Packet": "Total Length of Fwd Packets",
+    "Total Length of Fwd Packet(s)": "Total Length of Fwd Packets",
+    "Total Length of Bwd Packet": "Total Length of Bwd Packets",
+    "Total Length of Bwd Packet(s)": "Total Length of Bwd Packets",
+
+    # packet length min/max (V3 vs master_raw)
+    "Packet Length Min": "Min Packet Length",
+    "Packet Length Max": "Max Packet Length",
+
+    # avg segment size (V3 vs master_raw)
+    "Fwd Segment Size Avg": "Avg Fwd Segment Size",
+    "Bwd Segment Size Avg": "Avg Bwd Segment Size",
+    "Avg Fwd Segment Size": "Avg Fwd Segment Size",
+    "Avg Bwd Segment Size": "Avg Bwd Segment Size",
+
+    # init window bytes (V3 vs master_raw)
+    "FWD Init Win Bytes": "Init_Win_bytes_forward",
+    "Bwd Init Win Bytes": "Init_Win_bytes_backward",
+
+    # CWR/CWE 표기 흔한 차이
+    "CWR Flag Count": "CWE Flag Count",
+}
+
+DROP_KEYS = {"Flow ID", "Label", "source_file"}
+
+
+def _rename_and_clean(row_raw: Dict[str, Any], *, drop_label: bool) -> Dict[str, Any]:
+    """전처리 진입 전에: key strip + rename + drop + Fwd Header Length.1 복제"""
+    out: Dict[str, Any] = {}
+
+    for k, v in row_raw.items():
+        if k is None:
+            continue
+        kk = str(k).strip()
+
+        # drop
+        if kk in DROP_KEYS:
+            if kk == "Label" and (not drop_label):
+                pass
+            else:
+                continue
+
+        # rename
+        kk = RENAME_MAP.get(kk, kk)
+
+        out[kk] = v
+
+    # 학습에 'Fwd Header Length.1'이 들어갔으면, 실데이터에도 맞춰줘야 함
+    # (없으면 median으로 대체되어 feature가 죽음)
+    if "Fwd Header Length.1" not in out and "Fwd Header Length" in out:
+        out["Fwd Header Length.1"] = out["Fwd Header Length"]
+
+    return out
+
+
 @dataclass
 class OnlinePreprocessConfig:
     numeric_cols: List[str]
@@ -36,8 +107,6 @@ class OnlinePreprocessor:
         with open(config_path, "r", encoding="utf-8") as f:
             cfg = json.load(f)
 
-        # 네가 이미 median을 config에 넣었다고 했으니 여기서는 "필수"로 본다.
-        # (없으면 지금 파이프라인에서 전처리 재현이 불가능하니까 바로 죽는게 맞음)
         median = cfg.get("imputer", {}).get("median")
         if not isinstance(median, dict) or not median:
             raise RuntimeError(
@@ -47,7 +116,7 @@ class OnlinePreprocessor:
 
         self.cfg = OnlinePreprocessConfig(
             numeric_cols=cfg["numeric_cols"],
-            port_idx_map=cfg["port_idx_map"],           # key는 str로 저장돼 있을 가능성 큼
+            port_idx_map=cfg["port_idx_map"],
             other_port_idx=int(cfg["other_port_idx"]),
             proto_idx_map=cfg["proto_idx_map"],
             proto_other_idx=int(cfg["proto_other_idx"]),
@@ -85,11 +154,8 @@ class OnlinePreprocessor:
         num_cols = self.cfg.numeric_cols
 
         for raw in flows:
-            # 1) 컬럼명 strip (CICFlowMeter/CSV에서 공백 섞이는 경우 방어)
-            row = {str(k).strip(): v for k, v in raw.items()}
-
-            if drop_label and "Label" in row:
-                row.pop("Label", None)
+            # ✅ (수정) strip만 하지 말고 rename/drop/복제까지
+            row = _rename_and_clean(raw, drop_label=drop_label)
 
             # 2) 필수 raw 필드
             sport = row.get("Source Port", row.get("Src Port"))
@@ -115,7 +181,7 @@ class OnlinePreprocessor:
             # 5) numeric_cols를 median으로 채우고 scaling
             for c in num_cols:
                 med = self._to_float(self.cfg.median.get(c, 0.0), 0.0)
-                x = self._to_float(row.get(c), med)  # 없거나 이상하면 median
+                x = self._to_float(row.get(c), med)
                 mu = self._to_float(self.cfg.mean.get(c, 0.0), 0.0)
                 sd = self._to_float(self.cfg.std.get(c, 1.0), 1.0)
                 if sd == 0:

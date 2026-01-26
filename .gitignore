@@ -31,7 +31,10 @@ models/*.pt
 *.pptx
 *.docx
 *.csv
+*.txt
 
+# Folders
+src/sensor/schema_diff_out2/
 etc/
 research/
 results/
@@ -48,3 +51,4 @@ src/preprocess/test_*.py
 
 # Exceptions
 !processed/flows_test_scaled.parquet
+!requirements.txt

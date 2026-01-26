@@ -15,7 +15,7 @@ app = FastAPI()
 
 ROOT_DIR = Path(__file__).resolve().parents[1]  # NIDS 루트
 
-SPLUNK_HEC_URL = os.getenv("SPLUNK_HEC_URL", "https://192.168.0.7:8088/services/collector")
+SPLUNK_HEC_URL = os.getenv("SPLUNK_HEC_URL", "https://192.168.0.7:8088/services/collector/event")
 SPLUNK_HEC_TOKEN = os.getenv("SPLUNK_HEC_TOKEN", "<토큰>")
 SPLUNK_INDEX = os.getenv("SPLUNK_INDEX", "main")
 
