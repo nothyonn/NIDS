@@ -108,7 +108,7 @@ class FusionService:
 
         numeric_dim_base = len(self.numeric_cols)  # ex) 77
         window_feat_dim = 5
-        self.numeric_dim = numeric_dim_base + window_feat_dim
+        self.numeric_dim = numeric_dim_base + window_feat_dim  # ex) 82
 
         self.other_port_idx = int(self.cfg["other_port_idx"])
         self.other_proto_idx = int(self.cfg["proto_other_idx"])
@@ -122,7 +122,9 @@ class FusionService:
 
         # ---- online components ----
         self.prep = OnlinePreprocessor(self.config_path)
-        self.winbuf = OnlineWindowBuffer(seq_len=self.seq_len, stride=self.stride, max_buffer=max_buffer_per_dst)
+        self.winbuf = OnlineWindowBuffer(
+            seq_len=self.seq_len, stride=self.stride, max_buffer=max_buffer_per_dst
+        )
 
         # ---- models ----
         self.tcn_model = TCNTransformerModel(
@@ -195,8 +197,7 @@ class FusionService:
         except Exception:
             pass
 
-    def _schema_coverage(self, flows: List[Dict[str, Any]]) -> Dict[str, Any]:
-        sample = flows[0] if flows else {}
+    def _schema_coverage_from_sample(self, sample: Dict[str, Any]) -> Dict[str, Any]:
         keys = list(sample.keys())
         strict_set = set(keys)
 
@@ -223,7 +224,7 @@ class FusionService:
         flows: List[Dict[str, Any]],
         *,
         request_id: Optional[str] = None,
-        splunk_cfg: Optional[SplunkHECConfig],
+        splunk_cfg: Optional[SplunkHECConfig] = None,
         drop_label: bool = True,
         force_flush: bool = False,
         min_flush_len: int = 39,
@@ -235,22 +236,36 @@ class FusionService:
         if request_id is None:
             request_id = str(flows[0].get("_debug_request_id") or uuid.uuid4())
 
-        cov = self._schema_coverage(flows)
-        self._log_debug("ingest_begin", request_id=request_id, input_flows=len(flows), **cov)
+        # (1) raw 기준 커버리지 (참고용)
+        raw_cov = self._schema_coverage_from_sample(flows[0])
+        self._log_debug("ingest_begin", request_id=request_id, input_flows=len(flows), **raw_cov)
 
         # 1) preprocess
         rows = self.prep.transform(flows, drop_label=drop_label)
 
+        # (2) 전처리 후 커버리지 (실제 모델 입력에 가까운 기준)
+        if rows:
+            post_cov = self._schema_coverage_from_sample(rows[0])
+            self._log_debug("after_preprocess_schema", request_id=request_id, **post_cov)
+
         # 1.5) after preprocess quick stats
         try:
             n = max(1, len(rows))
-            sport_other = sum(1 for r in rows if int(r.get("sport_idx", self.other_port_idx)) == self.other_port_idx) / n
-            dport_other = sum(1 for r in rows if int(r.get("dport_idx", self.other_port_idx)) == self.other_port_idx) / n
-            proto_other = sum(1 for r in rows if int(r.get("proto_idx", self.other_proto_idx)) == self.other_proto_idx) / n
+            sport_other = sum(
+                1 for r in rows if int(r.get("sport_idx", self.other_port_idx)) == self.other_port_idx
+            ) / n
+            dport_other = sum(
+                1 for r in rows if int(r.get("dport_idx", self.other_port_idx)) == self.other_port_idx
+            ) / n
+            proto_other = sum(
+                1 for r in rows if int(r.get("proto_idx", self.other_proto_idx)) == self.other_proto_idx
+            ) / n
 
             ts_1970 = sum(
-                1 for r in rows
-                if isinstance(r.get("Timestamp"), pd.Timestamp) and r.get("Timestamp") <= pd.Timestamp("1970-01-01 00:00:01")
+                1
+                for r in rows
+                if isinstance(r.get("Timestamp"), pd.Timestamp)
+                and r.get("Timestamp") <= pd.Timestamp("1970-01-01 00:00:01")
             ) / n
 
             self._log_debug(
@@ -268,7 +283,9 @@ class FusionService:
         self.winbuf.add_flows(rows)
 
         # 3) pop windows
-        windows: List[WindowItem] = self.winbuf.pop_windows(force_flush=force_flush, min_flush_len=min_flush_len)
+        windows: List[WindowItem] = self.winbuf.pop_windows(
+            force_flush=force_flush, min_flush_len=min_flush_len
+        )
         if max_windows is not None:
             windows = windows[:max_windows]
 
@@ -300,28 +317,36 @@ class FusionService:
                 if not self.send_dropped_windows:
                     continue
 
-                events.append({
-                    "dst_ip": w.dst_ip,
-                    "real_len": int(w.real_len),
-                    "decision": {"source": "DROP", "attack": False, "attack_types": [], "reason": "too_short"},
-                    "meta": {
-                        "seq_len": self.seq_len,
-                        "stride": self.stride,
-                        "ts": time.time(),
-                        "request_id": request_id,
-                        "schema_id": self.schema_id,
-                        "config_sha256": self.config_sha256,
-                        "numeric_cols_hash": self.numeric_cols_hash,
-                    },
-                })
+                events.append(
+                    {
+                        "dst_ip": w.dst_ip,
+                        "real_len": int(w.real_len),
+                        "decision": {
+                            "source": "DROP",
+                            "attack": False,
+                            "attack_types": [],
+                            "reason": "too_short",
+                        },
+                        "meta": {
+                            "seq_len": self.seq_len,
+                            "stride": self.stride,
+                            "ts": time.time(),
+                            "request_id": request_id,
+                            "schema_id": self.schema_id,
+                            "config_sha256": self.config_sha256,
+                            "numeric_cols_hash": self.numeric_cols_hash,
+                            "model_version": self.model_version,
+                        },
+                    }
+                )
                 continue
 
             numeric, cat, mask, win_dbg = self._build_window_tensors(w)
 
             # ---- TCN ----
-            logits = self.tcn_model(numeric, cat, mask)   # [1, C]
-            probs = torch.sigmoid(logits)[0]              # [C]
-            preds = (probs >= 0.5)                        # [C]
+            logits = self.tcn_model(numeric, cat, mask)  # [1, C]
+            probs = torch.sigmoid(logits)[0]  # [C]
+            preds = probs >= 0.5
 
             k = min(3, self.num_classes)
             topv, topi = torch.topk(probs, k=k)
@@ -344,7 +369,13 @@ class FusionService:
 
             if not tcn_attack_any:
                 recon = self.ae_model(numeric, cat, mask)
-                scores = compute_ae_scores(recon=recon, target=numeric, mask=mask, agg_mode=self.ae_agg_mode, topk=self.ae_topk)
+                scores = compute_ae_scores(
+                    recon=recon,
+                    target=numeric,
+                    mask=mask,
+                    agg_mode=self.ae_agg_mode,
+                    topk=self.ae_topk,
+                )
                 ae_score = float(scores[0].item())
                 ae_used = True
                 ae_attack = ae_score >= self.ae_threshold
@@ -384,7 +415,12 @@ class FusionService:
             header_hash = sorted({str(r.get("_debug_header_hash")) for r in w.rows if r.get("_debug_header_hash")})[:3]
             schema_cov = None
             try:
-                schema_cov = float(next((r.get("_debug_schema_cov") for r in w.rows if r.get("_debug_schema_cov") is not None), None))
+                schema_cov = float(
+                    next(
+                        (r.get("_debug_schema_cov") for r in w.rows if r.get("_debug_schema_cov") is not None),
+                        None,
+                    )
+                )
             except Exception:
                 schema_cov = None
 
@@ -409,12 +445,14 @@ class FusionService:
                     "win": win_dbg,
                 }
 
-            events.append({
-                "dst_ip": w.dst_ip,
-                "real_len": int(w.real_len),
-                "decision": decision,
-                "meta": meta,
-            })
+            events.append(
+                {
+                    "dst_ip": w.dst_ip,
+                    "real_len": int(w.real_len),
+                    "decision": decision,
+                    "meta": meta,
+                }
+            )
 
             if wi < self.debug_windows:
                 self._log_debug(
@@ -455,7 +493,9 @@ class FusionService:
             "sent_events": sent_events,
         }
 
-    def _build_window_tensors(self, w: WindowItem) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
+    def _build_window_tensors(
+        self, w: WindowItem
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
         # ts_nonmono는 "정렬 전" 원본 순서에서 측정
         orig_ts = [r.get("Timestamp") for r in w.rows if r.get("Timestamp") is not None]
         ts_nonmono = 0.0
@@ -475,7 +515,11 @@ class FusionService:
 
         if self.sort_by_timestamp:
             try:
-                rows.sort(key=lambda r: r.get("Timestamp") if r.get("Timestamp") is not None else pd.Timestamp("1970-01-01"))
+                rows.sort(
+                    key=lambda r: r.get("Timestamp")
+                    if r.get("Timestamp") is not None
+                    else pd.Timestamp("1970-01-01")
+                )
             except Exception:
                 pass
 
@@ -488,7 +532,7 @@ class FusionService:
                 except Exception:
                     base[i, j] = 0.0
 
-        # window features
+        # window features (5)
         total_flows = float(real_len)
 
         src_vals = [r.get("Source IP") for r in rows if r.get("Source IP") is not None]
@@ -528,7 +572,7 @@ class FusionService:
 
         win_feat = np.array([f1, f2, f3, f4, f5], dtype=np.float32)
         win_feat_real = np.repeat(win_feat[None, :], real_len, axis=0)
-        numeric_real = np.concatenate([base, win_feat_real], axis=1)  # [real_len,82]
+        numeric_real = np.concatenate([base, win_feat_real], axis=1)  # [real_len, 82]
 
         numeric = np.zeros((L, numeric_real.shape[1]), dtype=np.float32)
         numeric[:real_len] = numeric_real
@@ -546,9 +590,9 @@ class FusionService:
         cat_t = torch.tensor(cat[None, :, :], dtype=torch.int64, device=self.device)
         mask_t = torch.tensor(mask[None, :], dtype=torch.float32, device=self.device)
 
-        # 디버깅: 입력이 상수화(median fill/컬럼미스) 되었는지 빠르게 확인
+        # 입력 상수화 체크
         try:
-            var_mean = float(np.mean(np.var(base, axis=0)))  # 0에 가까우면 "대부분 상수"
+            var_mean = float(np.mean(np.var(base, axis=0)))
         except Exception:
             var_mean = 0.0
 
