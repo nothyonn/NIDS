@@ -1,4 +1,3 @@
-# src/engine/service.py
 from __future__ import annotations
 
 import hashlib
@@ -122,9 +121,7 @@ class FusionService:
 
         # ---- online components ----
         self.prep = OnlinePreprocessor(self.config_path)
-        self.winbuf = OnlineWindowBuffer(
-            seq_len=self.seq_len, stride=self.stride, max_buffer=max_buffer_per_dst
-        )
+        self.winbuf = OnlineWindowBuffer(seq_len=self.seq_len, stride=self.stride, max_buffer=max_buffer_per_dst)
 
         # ---- models ----
         self.tcn_model = TCNTransformerModel(
@@ -162,9 +159,6 @@ class FusionService:
         print("  schema_id     :", self.schema_id)
         print("  model_version :", self.model_version)
 
-    # ---------------------------
-    # schema / debug utils
-    # ---------------------------
     def get_schema(self) -> Dict[str, Any]:
         return {
             "schema_id": self.schema_id,
@@ -218,6 +212,41 @@ class FusionService:
             "missing_norm_top": missing_norm[:20],
         }
 
+    def _ae_top_feature_errors(
+        self,
+        recon: torch.Tensor,
+        target: torch.Tensor,
+        mask: torch.Tensor,
+        topn: int = 8,
+    ) -> List[Dict[str, Any]]:
+        """
+        AE가 튀는 원인을 빠르게 찾기 위한 feature attribution.
+        - feature별 MSE(시간축 평균)를 계산하고 큰 순서대로 topn을 리턴.
+        """
+        # recon/target: [1,L,D], mask: [1,L]
+        with torch.no_grad():
+            m = (mask > 0).float().unsqueeze(-1)  # [1,L,1]
+            diff2 = (recon - target) ** 2
+            diff2 = diff2 * m
+            denom = torch.clamp(m.sum(dim=1), min=1.0)  # [1,1]
+            feat_mse = diff2.sum(dim=1) / denom  # [1,D]
+            feat_mse = feat_mse[0].detach().cpu().numpy()  # [D]
+
+        names = list(self.numeric_cols) + [
+            "win_log_unique_src",
+            "win_log_avg_flows_per_src",
+            "win_src_entropy_norm",
+            "win_log_duration",
+            "win_log_flow_rate",
+        ]
+
+        idx = np.argsort(-feat_mse)[: max(1, int(topn))]
+        out = []
+        for j in idx:
+            name = names[j] if j < len(names) else f"feat_{j}"
+            out.append({"feature": name, "mse": float(feat_mse[j])})
+        return out
+
     @torch.no_grad()
     def ingest_flows_and_send(
         self,
@@ -236,36 +265,24 @@ class FusionService:
         if request_id is None:
             request_id = str(flows[0].get("_debug_request_id") or uuid.uuid4())
 
-        # (1) raw 기준 커버리지 (참고용)
         raw_cov = self._schema_coverage_from_sample(flows[0])
         self._log_debug("ingest_begin", request_id=request_id, input_flows=len(flows), **raw_cov)
 
-        # 1) preprocess
         rows = self.prep.transform(flows, drop_label=drop_label)
 
-        # (2) 전처리 후 커버리지 (실제 모델 입력에 가까운 기준)
         if rows:
             post_cov = self._schema_coverage_from_sample(rows[0])
             self._log_debug("after_preprocess_schema", request_id=request_id, **post_cov)
 
-        # 1.5) after preprocess quick stats
         try:
             n = max(1, len(rows))
-            sport_other = sum(
-                1 for r in rows if int(r.get("sport_idx", self.other_port_idx)) == self.other_port_idx
-            ) / n
-            dport_other = sum(
-                1 for r in rows if int(r.get("dport_idx", self.other_port_idx)) == self.other_port_idx
-            ) / n
-            proto_other = sum(
-                1 for r in rows if int(r.get("proto_idx", self.other_proto_idx)) == self.other_proto_idx
-            ) / n
+            sport_other = sum(1 for r in rows if int(r.get("sport_idx", self.other_port_idx)) == self.other_port_idx) / n
+            dport_other = sum(1 for r in rows if int(r.get("dport_idx", self.other_port_idx)) == self.other_port_idx) / n
+            proto_other = sum(1 for r in rows if int(r.get("proto_idx", self.other_proto_idx)) == self.other_proto_idx) / n
 
             ts_1970 = sum(
-                1
-                for r in rows
-                if isinstance(r.get("Timestamp"), pd.Timestamp)
-                and r.get("Timestamp") <= pd.Timestamp("1970-01-01 00:00:01")
+                1 for r in rows
+                if isinstance(r.get("Timestamp"), pd.Timestamp) and r.get("Timestamp") <= pd.Timestamp("1970-01-01 00:00:01")
             ) / n
 
             self._log_debug(
@@ -279,13 +296,9 @@ class FusionService:
         except Exception:
             pass
 
-        # 2) buffer add
         self.winbuf.add_flows(rows)
 
-        # 3) pop windows
-        windows: List[WindowItem] = self.winbuf.pop_windows(
-            force_flush=force_flush, min_flush_len=min_flush_len
-        )
+        windows: List[WindowItem] = self.winbuf.pop_windows(force_flush=force_flush, min_flush_len=min_flush_len)
         if max_windows is not None:
             windows = windows[:max_windows]
 
@@ -302,7 +315,6 @@ class FusionService:
         for wi, w in enumerate(windows):
             popped_windows += 1
 
-            # 학습 규칙: 패딩 과다 윈도우 드랍(운영 안정성)
             if int(w.real_len) < self.min_real_len:
                 dropped_windows += 1
                 self._log_debug(
@@ -317,57 +329,29 @@ class FusionService:
                 if not self.send_dropped_windows:
                     continue
 
-                events.append(
-                    {
-                        "dst_ip": w.dst_ip,
-                        "real_len": int(w.real_len),
-                        "decision": {
-                            "source": "DROP",
-                            "attack": False,
-                            "attack_types": [],
-                            "reason": "too_short",
-                        },
-                        "meta": {
-                            "seq_len": self.seq_len,
-                            "stride": self.stride,
-                            "ts": time.time(),
-                            "request_id": request_id,
-                            "schema_id": self.schema_id,
-                            "config_sha256": self.config_sha256,
-                            "numeric_cols_hash": self.numeric_cols_hash,
-                            "model_version": self.model_version,
-                        },
-                    }
-                )
+                events.append({
+                    "dst_ip": w.dst_ip,
+                    "real_len": int(w.real_len),
+                    "decision": {"source": "DROP", "attack": False, "attack_types": [], "reason": "too_short"},
+                    "meta": {
+                        "seq_len": self.seq_len,
+                        "stride": self.stride,
+                        "ts": time.time(),
+                        "request_id": request_id,
+                        "schema_id": self.schema_id,
+                        "config_sha256": self.config_sha256,
+                        "numeric_cols_hash": self.numeric_cols_hash,
+                        "model_version": self.model_version,
+                    },
+                })
                 continue
 
-            # --------------------------
-            # PATCH: win_dbg에 입력 이상값이 담기도록 _build_window_tensors 수정
-            # --------------------------
             numeric, cat, mask, win_dbg = self._build_window_tensors(w)
-
-            # PATCH: 텐서 NaN/Inf는 모델 넣기 전에 반드시 제거 + 로그
-            try:
-                nan_n = int(torch.isnan(numeric).sum().item())
-                inf_n = int(torch.isinf(numeric).sum().item())
-                if nan_n > 0 or inf_n > 0:
-                    self._log_debug(
-                        "window_input_nan_inf",
-                        request_id=request_id,
-                        dst_ip=w.dst_ip,
-                        real_len=int(w.real_len),
-                        nan=nan_n,
-                        inf=inf_n,
-                        win=win_dbg,
-                    )
-                    numeric = torch.nan_to_num(numeric, nan=0.0, posinf=0.0, neginf=0.0)
-            except Exception:
-                pass
 
             # ---- TCN ----
             logits = self.tcn_model(numeric, cat, mask)  # [1, C]
-            probs = torch.sigmoid(logits)[0]  # [C]
-            preds = probs >= 0.5
+            probs = torch.sigmoid(logits)[0]             # [C]
+            preds = (probs >= 0.5)
 
             k = min(3, self.num_classes)
             topv, topi = torch.topk(probs, k=k)
@@ -387,6 +371,7 @@ class FusionService:
             ae_used = False
             ae_score = None
             ae_attack = False
+            ae_top_features: Optional[List[Dict[str, Any]]] = None
 
             if not tcn_attack_any:
                 recon = self.ae_model(numeric, cat, mask)
@@ -400,6 +385,10 @@ class FusionService:
                 ae_score = float(scores[0].item())
                 ae_used = True
                 ae_attack = ae_score >= self.ae_threshold
+
+                # ★ 여기 핵심: 어떤 feature가 에러를 키웠는지
+                if self.splunk_debug_meta:
+                    ae_top_features = self._ae_top_feature_errors(recon=recon, target=numeric, mask=mask, topn=8)
 
             # ---- decision ----
             if tcn_attack_any:
@@ -430,18 +419,12 @@ class FusionService:
             else:
                 decision = {"source": "NONE", "attack": False, "attack_types": [], "topk": topk}
 
-            # pipeline에서 넣은 trace 수집
             pcap_sources = sorted({str(r.get("_debug_pcap")) for r in w.rows if r.get("_debug_pcap")})[:3]
             csv_sources = sorted({str(r.get("_debug_csv")) for r in w.rows if r.get("_debug_csv")})[:3]
             header_hash = sorted({str(r.get("_debug_header_hash")) for r in w.rows if r.get("_debug_header_hash")})[:3]
             schema_cov = None
             try:
-                schema_cov = float(
-                    next(
-                        (r.get("_debug_schema_cov") for r in w.rows if r.get("_debug_schema_cov") is not None),
-                        None,
-                    )
-                )
+                schema_cov = float(next((r.get("_debug_schema_cov") for r in w.rows if r.get("_debug_schema_cov") is not None), None))
             except Exception:
                 schema_cov = None
 
@@ -458,22 +441,28 @@ class FusionService:
             }
 
             if self.splunk_debug_meta:
+                # 전처리 impute 비율(윈도우 평균)
+                try:
+                    imr = [float(r.get("_debug_imputed_ratio", 0.0)) for r in w.rows]
+                    impute_ratio_mean = float(np.mean(imr)) if imr else 0.0
+                except Exception:
+                    impute_ratio_mean = 0.0
+
                 meta["debug"] = {
                     "schema_cov": schema_cov,
                     "pcap": pcap_sources,
                     "csv": csv_sources,
                     "header_hash": header_hash,
-                    "win": win_dbg,
+                    "win": {**win_dbg, "impute_ratio_mean": impute_ratio_mean},
+                    "ae_top_features": ae_top_features,  # ★ 추가
                 }
 
-            events.append(
-                {
-                    "dst_ip": w.dst_ip,
-                    "real_len": int(w.real_len),
-                    "decision": decision,
-                    "meta": meta,
-                }
-            )
+            events.append({
+                "dst_ip": w.dst_ip,
+                "real_len": int(w.real_len),
+                "decision": decision,
+                "meta": meta,
+            })
 
             if wi < self.debug_windows:
                 self._log_debug(
@@ -486,6 +475,7 @@ class FusionService:
                     attack=bool(decision.get("attack")),
                     attack_types=decision.get("attack_types"),
                     win=win_dbg,
+                    ae_score=ae_score,
                 )
 
         if hec is not None and events:
@@ -514,10 +504,7 @@ class FusionService:
             "sent_events": sent_events,
         }
 
-    def _build_window_tensors(
-        self, w: WindowItem
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
-        # ts_nonmono는 "정렬 전" 원본 순서에서 측정
+    def _build_window_tensors(self, w: WindowItem) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
         orig_ts = [r.get("Timestamp") for r in w.rows if r.get("Timestamp") is not None]
         ts_nonmono = 0.0
         if len(orig_ts) >= 2:
@@ -531,26 +518,14 @@ class FusionService:
             ts_nonmono = bad / max(1, (len(orig_ts) - 1))
 
         rows = list(w.rows)
-        real_len_raw = int(w.real_len)
+        real_len = int(w.real_len)
         L = self.seq_len
 
         if self.sort_by_timestamp:
             try:
-                rows.sort(
-                    key=lambda r: r.get("Timestamp")
-                    if r.get("Timestamp") is not None
-                    else pd.Timestamp("1970-01-01")
-                )
+                rows.sort(key=lambda r: r.get("Timestamp") if r.get("Timestamp") is not None else pd.Timestamp("1970-01-01"))
             except Exception:
                 pass
-
-        # --------------------------
-        # PATCH 핵심 1) rows를 real_len로 자르기
-        # - 지금 원본 코드가 이게 없어서 base/cat 인덱스가 깨질 수 있음
-        # - 혹시 rows가 real_len보다 짧으면 그 짧은 길이로 맞춤
-        # --------------------------
-        real_len = min(real_len_raw, len(rows))
-        rows = rows[:real_len]
 
         # base numeric [real_len, 77]
         base = np.zeros((real_len, len(self.numeric_cols)), dtype=np.float32)
@@ -619,64 +594,19 @@ class FusionService:
         cat_t = torch.tensor(cat[None, :, :], dtype=torch.int64, device=self.device)
         mask_t = torch.tensor(mask[None, :], dtype=torch.float32, device=self.device)
 
-        # --------------------------
-        # PATCH 핵심 2) 입력 상수화/스케일 폭주 확인용 통계 확장
-        # --------------------------
         try:
-            var_mean = float(np.mean(np.var(base, axis=0))) if base.size else 0.0
-            base_min = float(np.min(base)) if base.size else 0.0
-            base_max = float(np.max(base)) if base.size else 0.0
-            base_mean_abs = float(np.mean(np.abs(base))) if base.size else 0.0
+            var_mean = float(np.mean(np.var(base, axis=0)))
         except Exception:
             var_mean = 0.0
-            base_min = 0.0
-            base_max = 0.0
-            base_mean_abs = 0.0
-
-        # cat other 비율(윈도우 단위)
-        try:
-            s_other = int(np.sum(cat[:real_len, 0] == self.other_port_idx))
-            d_other = int(np.sum(cat[:real_len, 1] == self.other_port_idx))
-            p_other = int(np.sum(cat[:real_len, 2] == self.other_proto_idx))
-            s_other_ratio = float(s_other / max(1, real_len))
-            d_other_ratio = float(d_other / max(1, real_len))
-            p_other_ratio = float(p_other / max(1, real_len))
-        except Exception:
-            s_other_ratio = d_other_ratio = p_other_ratio = 0.0
-
-        # --------------------------
-        # PATCH 핵심 3) 여기서도 NaN/Inf 카운트는 win_dbg에 노출
-        # (실제 처리는 ingest에서 nan_to_num 수행)
-        # --------------------------
-        try:
-            nan_n = int(torch.isnan(numeric_t).sum().item())
-            inf_n = int(torch.isinf(numeric_t).sum().item())
-        except Exception:
-            nan_n = 0
-            inf_n = 0
 
         win_dbg = {
-            "real_len_raw": int(real_len_raw),
-            "real_len_used": int(real_len),
-            "rows_len": int(len(w.rows)) if hasattr(w, "rows") else int(real_len),
             "unique_src": float(unique_src),
             "avg_flows_per_src": float(avg_flows_per_src),
             "src_entropy": float(src_ent_raw),
             "duration_s": float(window_duration),
             "flow_rate": float(flow_rate),
             "ts_nonmono_ratio": float(ts_nonmono),
-
             "base_var_mean": float(var_mean),
-            "base_min": float(base_min),
-            "base_max": float(base_max),
-            "base_mean_abs": float(base_mean_abs),
-
-            "sport_other_ratio_win": float(s_other_ratio),
-            "dport_other_ratio_win": float(d_other_ratio),
-            "proto_other_ratio_win": float(p_other_ratio),
-
-            "input_nan": int(nan_n),
-            "input_inf": int(inf_n),
         }
 
         return numeric_t, cat_t, mask_t, win_dbg
