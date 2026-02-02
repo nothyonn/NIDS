@@ -341,7 +341,28 @@ class FusionService:
                 )
                 continue
 
+            # --------------------------
+            # PATCH: win_dbg에 입력 이상값이 담기도록 _build_window_tensors 수정
+            # --------------------------
             numeric, cat, mask, win_dbg = self._build_window_tensors(w)
+
+            # PATCH: 텐서 NaN/Inf는 모델 넣기 전에 반드시 제거 + 로그
+            try:
+                nan_n = int(torch.isnan(numeric).sum().item())
+                inf_n = int(torch.isinf(numeric).sum().item())
+                if nan_n > 0 or inf_n > 0:
+                    self._log_debug(
+                        "window_input_nan_inf",
+                        request_id=request_id,
+                        dst_ip=w.dst_ip,
+                        real_len=int(w.real_len),
+                        nan=nan_n,
+                        inf=inf_n,
+                        win=win_dbg,
+                    )
+                    numeric = torch.nan_to_num(numeric, nan=0.0, posinf=0.0, neginf=0.0)
+            except Exception:
+                pass
 
             # ---- TCN ----
             logits = self.tcn_model(numeric, cat, mask)  # [1, C]
@@ -510,7 +531,7 @@ class FusionService:
             ts_nonmono = bad / max(1, (len(orig_ts) - 1))
 
         rows = list(w.rows)
-        real_len = int(w.real_len)
+        real_len_raw = int(w.real_len)
         L = self.seq_len
 
         if self.sort_by_timestamp:
@@ -522,6 +543,14 @@ class FusionService:
                 )
             except Exception:
                 pass
+
+        # --------------------------
+        # PATCH 핵심 1) rows를 real_len로 자르기
+        # - 지금 원본 코드가 이게 없어서 base/cat 인덱스가 깨질 수 있음
+        # - 혹시 rows가 real_len보다 짧으면 그 짧은 길이로 맞춤
+        # --------------------------
+        real_len = min(real_len_raw, len(rows))
+        rows = rows[:real_len]
 
         # base numeric [real_len, 77]
         base = np.zeros((real_len, len(self.numeric_cols)), dtype=np.float32)
@@ -590,20 +619,64 @@ class FusionService:
         cat_t = torch.tensor(cat[None, :, :], dtype=torch.int64, device=self.device)
         mask_t = torch.tensor(mask[None, :], dtype=torch.float32, device=self.device)
 
-        # 입력 상수화 체크
+        # --------------------------
+        # PATCH 핵심 2) 입력 상수화/스케일 폭주 확인용 통계 확장
+        # --------------------------
         try:
-            var_mean = float(np.mean(np.var(base, axis=0)))
+            var_mean = float(np.mean(np.var(base, axis=0))) if base.size else 0.0
+            base_min = float(np.min(base)) if base.size else 0.0
+            base_max = float(np.max(base)) if base.size else 0.0
+            base_mean_abs = float(np.mean(np.abs(base))) if base.size else 0.0
         except Exception:
             var_mean = 0.0
+            base_min = 0.0
+            base_max = 0.0
+            base_mean_abs = 0.0
+
+        # cat other 비율(윈도우 단위)
+        try:
+            s_other = int(np.sum(cat[:real_len, 0] == self.other_port_idx))
+            d_other = int(np.sum(cat[:real_len, 1] == self.other_port_idx))
+            p_other = int(np.sum(cat[:real_len, 2] == self.other_proto_idx))
+            s_other_ratio = float(s_other / max(1, real_len))
+            d_other_ratio = float(d_other / max(1, real_len))
+            p_other_ratio = float(p_other / max(1, real_len))
+        except Exception:
+            s_other_ratio = d_other_ratio = p_other_ratio = 0.0
+
+        # --------------------------
+        # PATCH 핵심 3) 여기서도 NaN/Inf 카운트는 win_dbg에 노출
+        # (실제 처리는 ingest에서 nan_to_num 수행)
+        # --------------------------
+        try:
+            nan_n = int(torch.isnan(numeric_t).sum().item())
+            inf_n = int(torch.isinf(numeric_t).sum().item())
+        except Exception:
+            nan_n = 0
+            inf_n = 0
 
         win_dbg = {
+            "real_len_raw": int(real_len_raw),
+            "real_len_used": int(real_len),
+            "rows_len": int(len(w.rows)) if hasattr(w, "rows") else int(real_len),
             "unique_src": float(unique_src),
             "avg_flows_per_src": float(avg_flows_per_src),
             "src_entropy": float(src_ent_raw),
             "duration_s": float(window_duration),
             "flow_rate": float(flow_rate),
             "ts_nonmono_ratio": float(ts_nonmono),
+
             "base_var_mean": float(var_mean),
+            "base_min": float(base_min),
+            "base_max": float(base_max),
+            "base_mean_abs": float(base_mean_abs),
+
+            "sport_other_ratio_win": float(s_other_ratio),
+            "dport_other_ratio_win": float(d_other_ratio),
+            "proto_other_ratio_win": float(p_other_ratio),
+
+            "input_nan": int(nan_n),
+            "input_inf": int(inf_n),
         }
 
         return numeric_t, cat_t, mask_t, win_dbg

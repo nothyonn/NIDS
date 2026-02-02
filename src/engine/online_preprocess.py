@@ -38,10 +38,15 @@ RENAME_MAP: Dict[str, str] = {
     # avg segment size (V3 vs master_raw)
     "Fwd Segment Size Avg": "Avg Fwd Segment Size",
     "Bwd Segment Size Avg": "Avg Bwd Segment Size",
+    # 혹시 이미 학습 헤더로 들어오는 경우도 방어
+    "Avg Fwd Segment Size": "Avg Fwd Segment Size",
+    "Avg Bwd Segment Size": "Avg Bwd Segment Size",
 
-    # init window bytes (V3 vs master_raw)
+    # init window bytes (V3 vs master_raw)  ← 여기 대소문자 변형이 치명적이라 확장
+    "Fwd Init Win Bytes": "Init_Win_bytes_forward",
     "FWD Init Win Bytes": "Init_Win_bytes_forward",
     "Bwd Init Win Bytes": "Init_Win_bytes_backward",
+    "BWD Init Win Bytes": "Init_Win_bytes_backward",
 
     # CWR/CWE 표기 흔한 차이
     "CWR Flag Count": "CWE Flag Count",
@@ -69,7 +74,7 @@ def _is_bad_number(v: Any) -> bool:
     online 값에서 자주 나오는 문제들:
     - None, "", "NaN", "Infinity", "inf" 등
     - float('nan'), float('inf')
-    이런 경우는 전부 median으로 치환하는 게 학습 전처리 재현에 유리함.
+    이런 경우는 전부 median으로 치환
     """
     if v is None:
         return True
@@ -118,7 +123,6 @@ def _rename_and_clean(row_raw: Dict[str, Any], *, drop_label: bool) -> Dict[str,
         # drop
         if kk in DROP_KEYS:
             if kk == "Label" and (not drop_label):
-                # label 유지해야 하는 경우만 예외
                 pass
             else:
                 continue
@@ -128,7 +132,6 @@ def _rename_and_clean(row_raw: Dict[str, Any], *, drop_label: bool) -> Dict[str,
         out[kk] = v
 
     # 학습에 'Fwd Header Length.1'이 들어갔으면 실데이터에도 맞춰줘야 함
-    # (없으면 median으로 대체되며 feature가 죽어버림)
     if "Fwd Header Length.1" not in out and "Fwd Header Length" in out:
         out["Fwd Header Length.1"] = out["Fwd Header Length"]
 
@@ -144,18 +147,16 @@ class OnlinePreprocessConfig:
     proto_other_idx: int
     mean: Dict[str, float]
     std: Dict[str, float]
-    median: Dict[str, float]  # 반드시 있어야 함
+    median: Dict[str, float]
 
 
 class OnlinePreprocessor:
     """
-    센서가 CICFlowMeter로 만든 flow(dict)를 받아서,
-    학습 때 second_preprocess와 동일한 규칙으로:
+    학습 때 second_preprocess와 동일 규칙 재현:
       - rename/drop/복제(Fwd Header Length.1)
       - NaN/Inf/이상값 -> train median
       - Standard scaling (train mean/std)
       - sport/dport/proto index 생성
-    까지 끝낸 row(dict)로 만든다.
     """
 
     def __init__(self, config_path: str | Path):
@@ -172,7 +173,7 @@ class OnlinePreprocessor:
 
         self.cfg = OnlinePreprocessConfig(
             numeric_cols=cfg["numeric_cols"],
-            port_idx_map=cfg["port_idx_map"],  # key는 str로 저장돼 있을 가능성 큼
+            port_idx_map=cfg["port_idx_map"],
             other_port_idx=int(cfg["other_port_idx"]),
             proto_idx_map=cfg["proto_idx_map"],
             proto_other_idx=int(cfg["proto_other_idx"]),
