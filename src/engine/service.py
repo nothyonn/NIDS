@@ -18,7 +18,7 @@ from TCN_Transformer import TCNTransformerModel
 from AutoEncoder import TCNAutoencoder
 
 from .fusion_model import compute_ae_scores
-from .online_preprocess import OnlinePreprocessor, rename_and_clean_only
+from .online_preprocess import OnlinePreprocessor
 from .online_window import OnlineWindowBuffer, WindowItem
 from .hec_client import SplunkHECClient, SplunkHECConfig
 
@@ -215,10 +215,11 @@ class FusionService:
         raw_cov = self._schema_coverage(flows[0])
         self._log_debug("ingest_begin", request_id=request_id, input_flows=len(flows), **raw_cov)
 
-        # (B) rename/drop만 적용한 뒤 커버리지 (✅ 이게 “rename이 맞는지” 핵심)
-        renamed0 = rename_and_clean_only(flows[0], drop_label=drop_label)
+        # (B) rename/drop만 적용한 뒤 커버리지 (✅ rename 맞는지 핵심)
+        renamed0 = self.prep.rename_and_clean_only(flows[0], drop_label=drop_label)
         ren_cov = self._schema_coverage(renamed0)
         self._log_debug("after_rename_schema", request_id=request_id, **ren_cov)
+
 
         # 1) preprocess (학습 규칙 재현 + row단 debug)
         rows = self.prep.transform(flows, drop_label=drop_label, attach_debug=True)
