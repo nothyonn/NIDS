@@ -3,24 +3,19 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List
 
 import pandas as pd
 
-
-# ---------------------------
-# 컬럼 rename / drop 규칙
-# ---------------------------
 BASE_RENAME_MAP: Dict[str, str] = {
-    # IP/Port (CICFlowMeter V3 헤더 ↔ 학습 헤더)
     "Src IP": "Source IP",
     "Dst IP": "Destination IP",
     "Src Port": "Source Port",
     "Dst Port": "Destination Port",
 
-    # packet count / length
     "Total Fwd Packet": "Total Fwd Packets",
     "Total Fwd Packet(s)": "Total Fwd Packets",
     "Total Bwd packets": "Total Backward Packets",
@@ -31,20 +26,27 @@ BASE_RENAME_MAP: Dict[str, str] = {
     "Total Length of Bwd Packet": "Total Length of Bwd Packets",
     "Total Length of Bwd Packet(s)": "Total Length of Bwd Packets",
 
-    # packet length min/max
     "Packet Length Min": "Min Packet Length",
     "Packet Length Max": "Max Packet Length",
 
-    # avg segment size
     "Fwd Segment Size Avg": "Avg Fwd Segment Size",
     "Bwd Segment Size Avg": "Avg Bwd Segment Size",
 
-    # init window bytes
     "FWD Init Win Bytes": "Init_Win_bytes_forward",
     "Bwd Init Win Bytes": "Init_Win_bytes_backward",
 
-    # CWR/CWE
     "CWR Flag Count": "CWE Flag Count",
+
+    # ✅ Bulk (CICFlowMeter 변형들)
+    "Fwd Bytes/Bulk Avg": "Fwd Avg Bytes/Bulk",
+    "Fwd Packet/Bulk Avg": "Fwd Avg Packets/Bulk",
+    "Fwd Packets/Bulk Avg": "Fwd Avg Packets/Bulk",
+    "Fwd Bulk Rate Avg": "Fwd Avg Bulk Rate",
+
+    "Bwd Bytes/Bulk Avg": "Bwd Avg Bytes/Bulk",
+    "Bwd Packet/Bulk Avg": "Bwd Avg Packets/Bulk",
+    "Bwd Packets/Bulk Avg": "Bwd Avg Packets/Bulk",
+    "Bwd Bulk Rate Avg": "Bwd Avg Bulk Rate",
 }
 
 DROP_KEYS = {"Flow ID", "Label", "source_file"}
@@ -58,15 +60,22 @@ def _norm_key(k: Any) -> str:
     return s
 
 
+def _canon(s: str) -> str:
+    """
+    키 비교를 위한 캐노니컬 형태.
+    - lower
+    - 알파넘/숫자 제외는 공백으로
+    - 공백 collapse
+    """
+    s = _norm_key(s).lower()
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    s = " ".join(s.split())
+    return s
+
+
 def _coerce_nan_like(v: Any) -> Any:
-    """
-    master_raw.py 의도 재현:
-    - "Infinity"/"NaN" 같은 문자열, inf/-inf → None
-    - 숫자 변환 실패 → None (to_numeric(errors="coerce")와 동치)
-    """
     if v is None:
         return None
-
     try:
         if pd.isna(v):
             return None
@@ -103,12 +112,6 @@ class OnlinePreprocessConfig:
 
 
 class OnlinePreprocessor:
-    """
-    학습 파이프라인과 일치:
-    - master_raw: 문자열 Infinity/NaN/inf 처리 + to_numeric(errors="coerce") 의도
-    - second_preprocess: NaN -> median, scaling(mean/std)
-    """
-
     def __init__(self, config_path: str | Path):
         config_path = Path(config_path).resolve()
         with open(config_path, "r", encoding="utf-8") as f:
@@ -116,10 +119,7 @@ class OnlinePreprocessor:
 
         median = cfg.get("imputer", {}).get("median")
         if not isinstance(median, dict) or not median:
-            raise RuntimeError(
-                "preprocess_config.json에 imputer.median이 없습니다. "
-                "second_preprocess에서 train median 저장한 config로 맞추세요."
-            )
+            raise RuntimeError("preprocess_config.json에 imputer.median이 없습니다.")
 
         self.cfg = OnlinePreprocessConfig(
             numeric_cols=cfg["numeric_cols"],
@@ -132,71 +132,47 @@ class OnlinePreprocessor:
             median=median,
         )
 
-        # ---- canonical maps (핵심) ----
+        # ✅ “들어오는 키가 뭐든” numeric_cols의 정확한 키로 붙잡기 위한 dict
+        self._canon_to_exact: Dict[str, str] = {_canon(c): c for c in self.cfg.numeric_cols}
+
+        # ✅ 추가로 자주 쓰는 raw 필드도 캐노니컬 매칭 (혹시 센서가 이상하게 보내도 살림)
+        for extra in ["Source IP", "Destination IP", "Timestamp", "Protocol", "Source Port", "Destination Port"]:
+            self._canon_to_exact.setdefault(_canon(extra), extra)
+
+        # rename_map 확정 (BASE + config 기반으로 act/minseg도 안전하게 흡수)
+        self.rename_map = dict(BASE_RENAME_MAP)
+
+        # config에 실제 들어있는 이름으로 유도 (프로젝트마다 표기 다를 수 있음)
         nc = set(self.cfg.numeric_cols)
 
-        # numeric_cols의 "정확한 표기"로 맞춰주기 위한 lower->canonical
-        self._lower_to_canon: Dict[str, str] = {}
-        for c in self.cfg.numeric_cols:
-            self._lower_to_canon[_norm_key(c).lower()] = c
-
-        def pick_ci(*cands: str) -> str | None:
-            """
-            config numeric_cols 기준으로 후보 이름을 대소문자 무시 매칭해서
-            '정확히 그 numeric_cols 이름'을 리턴
-            """
-            for cand in cands:
-                if cand in nc:
-                    return cand
-                key = _norm_key(cand).lower()
-                if key in self._lower_to_canon:
-                    return self._lower_to_canon[key]
+        def pick(*cands: str) -> str | None:
+            for c in cands:
+                if c in nc:
+                    return c
             return None
 
-        # rename_map 확정 (raw -> canonical)
-        self.rename_map: Dict[str, str] = dict(BASE_RENAME_MAP)
-
-        # ✅ Bulk 6개: CICFlowMeter V3 이름 -> 학습 numeric_cols 이름(대소문자 무시 매칭)
-        fwd_bytes_bulk = pick_ci("Fwd Avg Bytes/Bulk", "fwd avg bytes/bulk")
-        fwd_pkts_bulk  = pick_ci("Fwd Avg Packets/Bulk", "fwd avg packets/bulk")
-        fwd_rate_bulk  = pick_ci("Fwd Avg Bulk Rate", "fwd avg bulk rate")
-        bwd_bytes_bulk = pick_ci("Bwd Avg Bytes/Bulk", "bwd avg bytes/bulk")
-        bwd_pkts_bulk  = pick_ci("Bwd Avg Packets/Bulk", "bwd avg packets/bulk")
-        bwd_rate_bulk  = pick_ci("Bwd Avg Bulk Rate", "bwd avg bulk rate")
-
-        if fwd_bytes_bulk: self.rename_map["Fwd Bytes/Bulk Avg"] = fwd_bytes_bulk
-        if fwd_pkts_bulk:  self.rename_map["Fwd Packet/Bulk Avg"] = fwd_pkts_bulk
-        if fwd_rate_bulk:  self.rename_map["Fwd Bulk Rate Avg"] = fwd_rate_bulk
-        if bwd_bytes_bulk: self.rename_map["Bwd Bytes/Bulk Avg"] = bwd_bytes_bulk
-        if bwd_pkts_bulk:  self.rename_map["Bwd Packet/Bulk Avg"] = bwd_pkts_bulk
-        if bwd_rate_bulk:  self.rename_map["Bwd Bulk Rate Avg"] = bwd_rate_bulk
-
-        # ✅ act/min_seg 2개도 동일하게 config 기준으로 canonical 매핑
-        act_target = pick_ci("act_data_pkt_fwd", "Act data pkt fwd", "act data pkt fwd", "Fwd Act Data Pkts")
-        minseg_target = pick_ci("min_seg_size_forward", "Min Seg Size Forward", "min seg size forward", "Fwd Seg Size Min")
+        act_target = pick("act_data_pkt_fwd", "Act data pkt fwd", "act data pkt fwd", "Fwd Act Data Pkts")
+        minseg_target = pick("min_seg_size_forward", "Min Seg Size Forward", "min seg size forward", "Fwd Seg Size Min")
 
         if act_target is not None:
             self.rename_map["Fwd Act Data Pkts"] = act_target
         if minseg_target is not None:
             self.rename_map["Fwd Seg Size Min"] = minseg_target
 
-        # ✅ 안전장치: scaler/median 키가 numeric_cols를 제대로 커버하는지 검증
-        miss_mean = sorted(list(nc - set(self.cfg.mean.keys())))
-        miss_std = sorted(list(nc - set(self.cfg.std.keys())))
-        miss_med = sorted(list(nc - set(self.cfg.median.keys())))
+        # ✅ scaler/median 키 커버리지 체크
+        nc_set = set(self.cfg.numeric_cols)
+        miss_mean = nc_set - set(self.cfg.mean.keys())
+        miss_std = nc_set - set(self.cfg.std.keys())
+        miss_med = nc_set - set(self.cfg.median.keys())
         if miss_mean or miss_std or miss_med:
             raise RuntimeError(
                 "preprocess_config.json scaler/median 키가 numeric_cols와 불일치합니다.\n"
-                f"- missing mean: {miss_mean[:10]} (total {len(miss_mean)})\n"
-                f"- missing std : {miss_std[:10]} (total {len(miss_std)})\n"
-                f"- missing med : {miss_med[:10]} (total {len(miss_med)})\n"
+                f"- missing mean: {sorted(list(miss_mean))[:10]} (total {len(miss_mean)})\n"
+                f"- missing std : {sorted(list(miss_std))[:10]} (total {len(miss_std)})\n"
+                f"- missing med : {sorted(list(miss_med))[:10]} (total {len(miss_med)})\n"
             )
 
     def rename_and_clean_only(self, row_raw: Dict[str, Any], *, drop_label: bool) -> Dict[str, Any]:
-        """
-        ✅ 여기서는 scaling/median 채우기 X
-        ✅ rename + canonicalize(대소문자 불일치 해결)만 수행
-        """
         out: Dict[str, Any] = {}
 
         for k, v in row_raw.items():
@@ -210,17 +186,16 @@ class OnlinePreprocessor:
                 else:
                     continue
 
+            # 1) base rename
             kk = self.rename_map.get(kk, kk)
 
-            # ✅ 핵심: 학습 numeric_cols 표기와 대소문자/공백 차이로 mismatch 나는 것 해결
-            # (ex: "Bwd Avg Bytes/Bulk" -> "bwd avg bytes/bulk" 같은 케이스)
-            low = _norm_key(kk).lower()
-            if low in self._lower_to_canon:
-                kk = self._lower_to_canon[low]
+            # 2) canonical match → exact key
+            ck = _canon(kk)
+            if ck in self._canon_to_exact:
+                kk = self._canon_to_exact[ck]
 
             out[kk] = v
 
-        # 학습 스키마 맞추기
         if "Fwd Header Length.1" not in out and "Fwd Header Length" in out:
             out["Fwd Header Length.1"] = out["Fwd Header Length"]
 
@@ -264,7 +239,6 @@ class OnlinePreprocessor:
         for raw in flows:
             row = self.rename_and_clean_only(raw, drop_label=drop_label)
 
-            # ports/proto
             sport = row.get("Source Port", row.get("Src Port"))
             dport = row.get("Destination Port", row.get("Dst Port"))
             proto = row.get("Protocol")
@@ -273,19 +247,16 @@ class OnlinePreprocessor:
             row["Destination Port"] = self._to_int(dport, self.cfg.other_port_idx)
             row["Protocol"] = self._to_int(proto, self.cfg.proto_other_idx)
 
-            # Timestamp
             ts = row.get("Timestamp")
             ts = pd.to_datetime(str(ts).strip(), errors="coerce") if ts is not None else pd.NaT
             if pd.isna(ts):
                 ts = pd.Timestamp("1970-01-01")
             row["Timestamp"] = ts
 
-            # idx
             row["sport_idx"] = self._map_port(row["Source Port"])
             row["dport_idx"] = self._map_port(row["Destination Port"])
             row["proto_idx"] = self._map_proto(row["Protocol"])
 
-            # numeric fill+scale
             imputed_cols: List[str] = []
             missing_cols: List[str] = []
 
