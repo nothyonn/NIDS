@@ -5,7 +5,7 @@ import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
 import pandas as pd
 
@@ -13,7 +13,7 @@ import pandas as pd
 # ---------------------------
 # 컬럼 rename / drop 규칙
 # ---------------------------
-RENAME_MAP: Dict[str, str] = {
+BASE_RENAME_MAP: Dict[str, str] = {
     # IP/Port (CICFlowMeter V3 헤더 ↔ 학습 헤더)
     "Src IP": "Source IP",
     "Dst IP": "Destination IP",
@@ -45,6 +45,14 @@ RENAME_MAP: Dict[str, str] = {
 
     # CWR/CWE 표기 흔한 차이
     "CWR Flag Count": "CWE Flag Count",
+
+    # ✅ (중요) CICFlowMeter V3 Bulk 이름 → 학습 스키마 이름
+    "Fwd Bytes/Bulk Avg": "Fwd Avg Bytes/Bulk",
+    "Fwd Packet/Bulk Avg": "Fwd Avg Packets/Bulk",
+    "Fwd Bulk Rate Avg": "Fwd Avg Bulk Rate",
+    "Bwd Bytes/Bulk Avg": "Bwd Avg Bytes/Bulk",
+    "Bwd Packet/Bulk Avg": "Bwd Avg Packets/Bulk",
+    "Bwd Bulk Rate Avg": "Bwd Avg Bulk Rate",
 }
 
 DROP_KEYS = {"Flow ID", "Label", "source_file"}
@@ -60,14 +68,13 @@ def _norm_key(k: Any) -> str:
 
 def _coerce_nan_like(v: Any) -> Any:
     """
-    master_raw.py에서 하던 것과 동일한 의도:
-    - object 컬럼에 들어오는 "Infinity"/"NaN" 같은 문자열을 NaN으로
-    - 숫자형 inf/-inf도 NaN으로
+    master_raw.py 의도 재현:
+    - "Infinity"/"NaN" 같은 문자열, inf/-inf → None
+    - 숫자 변환 실패 → None (to_numeric(errors="coerce")와 동치)
     """
     if v is None:
         return None
 
-    # pandas NaN
     try:
         if pd.isna(v):
             return None
@@ -81,44 +88,14 @@ def _coerce_nan_like(v: Any) -> Any:
         if s in ("infinity", "+infinity", "-infinity", "inf", "+inf", "-inf"):
             return None
 
-    # 숫자로 변환 가능한데 inf면 None
     try:
         fv = float(v)
         if not math.isfinite(fv):
             return None
     except Exception:
-        # 숫자 변환 실패 -> None 처리(학습 전처리에서 to_numeric(errors="coerce")와 동치)
         return None
 
     return v
-
-
-def rename_and_clean_only(row_raw: Dict[str, Any], *, drop_label: bool) -> Dict[str, Any]:
-    """
-    ✅ 여기 단계는 "스키마/rename 문제를 잡기 위한 단계"라서
-    numeric_cols 강제 생성/스케일링/median 대체 같은 걸 절대 하지 않음.
-    """
-    out: Dict[str, Any] = {}
-
-    for k, v in row_raw.items():
-        kk = _norm_key(k)
-        if not kk:
-            continue
-
-        if kk in DROP_KEYS:
-            if kk == "Label" and (not drop_label):
-                pass
-            else:
-                continue
-
-        kk = RENAME_MAP.get(kk, kk)
-        out[kk] = v
-
-    # 학습 스키마 맞추기
-    if "Fwd Header Length.1" not in out and "Fwd Header Length" in out:
-        out["Fwd Header Length.1"] = out["Fwd Header Length"]
-
-    return out
 
 
 @dataclass
@@ -163,8 +140,30 @@ class OnlinePreprocessor:
             median=median,
         )
 
-        # ✅ 안전장치: scaler/median 키가 numeric_cols를 제대로 커버하는지 즉시 검증
+        # ✅ config 기준으로 “모호한” 컬럼 타겟을 동적으로 결정
         nc = set(self.cfg.numeric_cols)
+
+        def pick(*cands: str) -> str | None:
+            for c in cands:
+                if c in nc:
+                    return c
+            return None
+
+        # act_data / min_seg 는 프로젝트마다 스키마 표기가 달라질 수 있어서 안전하게 처리
+        self._act_data_target = pick("act_data_pkt_fwd", "Act data pkt fwd", "act data pkt fwd", "Fwd Act Data Pkts")
+        self._min_seg_target = pick("min_seg_size_forward", "Min Seg Size Forward", "Fwd Seg Size Min")
+
+        # rename_map 확정
+        self.rename_map: Dict[str, str] = dict(BASE_RENAME_MAP)
+
+        # ✅ CICFlowMeter V3 원본 이름들을 config가 기대하는 이름으로 맞추기
+        if self._act_data_target is not None:
+            self.rename_map["Fwd Act Data Pkts"] = self._act_data_target
+
+        if self._min_seg_target is not None:
+            self.rename_map["Fwd Seg Size Min"] = self._min_seg_target
+
+        # ✅ 안전장치: scaler/median 키가 numeric_cols를 제대로 커버하는지 즉시 검증
         miss_mean = sorted(list(nc - set(self.cfg.mean.keys())))
         miss_std = sorted(list(nc - set(self.cfg.std.keys())))
         miss_med = sorted(list(nc - set(self.cfg.median.keys())))
@@ -174,8 +173,30 @@ class OnlinePreprocessor:
                 f"- missing mean: {miss_mean[:10]} (total {len(miss_mean)})\n"
                 f"- missing std : {miss_std[:10]} (total {len(miss_std)})\n"
                 f"- missing med : {miss_med[:10]} (total {len(miss_med)})\n"
-                "=> 이 상태면 online scaling이 학습과 달라져서 AE가 전부 anomaly로 터질 수 있습니다."
             )
+
+    def rename_and_clean_only(self, row_raw: Dict[str, Any], *, drop_label: bool) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+
+        for k, v in row_raw.items():
+            kk = _norm_key(k)
+            if not kk:
+                continue
+
+            if kk in DROP_KEYS:
+                if kk == "Label" and (not drop_label):
+                    pass
+                else:
+                    continue
+
+            kk = self.rename_map.get(kk, kk)
+            out[kk] = v
+
+        # 학습 스키마 맞추기
+        if "Fwd Header Length.1" not in out and "Fwd Header Length" in out:
+            out["Fwd Header Length.1"] = out["Fwd Header Length"]
+
+        return out
 
     @staticmethod
     def _to_int(v: Any, default: int) -> int:
@@ -214,7 +235,7 @@ class OnlinePreprocessor:
 
         for raw in flows:
             # 1) rename/drop/복제(스키마 단계)
-            row = rename_and_clean_only(raw, drop_label=drop_label)
+            row = self.rename_and_clean_only(raw, drop_label=drop_label)
 
             # 2) 필수 raw 필드(포트/프로토콜)
             sport = row.get("Source Port", row.get("Src Port"))
