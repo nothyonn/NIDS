@@ -1,3 +1,4 @@
+# src/engine/service.py
 from __future__ import annotations
 
 import hashlib
@@ -17,7 +18,7 @@ from TCN_Transformer import TCNTransformerModel
 from AutoEncoder import TCNAutoencoder
 
 from .fusion_model import compute_ae_scores
-from .online_preprocess import OnlinePreprocessor
+from .online_preprocess import OnlinePreprocessor, rename_and_clean_only
 from .online_window import OnlineWindowBuffer, WindowItem
 from .hec_client import SplunkHECClient, SplunkHECConfig
 
@@ -90,7 +91,6 @@ class FusionService:
         self.sort_by_timestamp = os.getenv("SORT_ROWS_BY_TIMESTAMP", "1") == "1"
         self.send_dropped_windows = os.getenv("SEND_DROPPED_WINDOWS", "0") == "1"
 
-        # 학습 규칙(패딩 70% 이상 drop) 기본값: MIN_REAL_RATIO=0.3
         self.min_real_ratio = float(os.getenv("MIN_REAL_RATIO", "0.3"))
         self.min_real_len = max(1, int(math.ceil(self.seq_len * self.min_real_ratio)))
 
@@ -105,9 +105,9 @@ class FusionService:
         self.label_classes = self.cfg["label_classes"]
         self.num_classes = len(self.label_classes)
 
-        numeric_dim_base = len(self.numeric_cols)  # ex) 77
+        numeric_dim_base = len(self.numeric_cols)
         window_feat_dim = 5
-        self.numeric_dim = numeric_dim_base + window_feat_dim  # ex) 82
+        self.numeric_dim = numeric_dim_base + window_feat_dim
 
         self.other_port_idx = int(self.cfg["other_port_idx"])
         self.other_proto_idx = int(self.cfg["proto_other_idx"])
@@ -159,40 +159,21 @@ class FusionService:
         print("  schema_id     :", self.schema_id)
         print("  model_version :", self.model_version)
 
-    def get_schema(self) -> Dict[str, Any]:
-        return {
-            "schema_id": self.schema_id,
-            "config_sha256": self.config_sha256,
-            "numeric_cols_hash": self.numeric_cols_hash,
-            "numeric_cols": self.numeric_cols,
-            "label_classes": self.label_classes,
-            "other_port_idx": self.other_port_idx,
-            "other_proto_idx": self.other_proto_idx,
-            "seq_len": self.seq_len,
-            "stride": self.stride,
-            "min_real_len": self.min_real_len,
-            "min_real_ratio": self.min_real_ratio,
-            "model_version": self.model_version,
-        }
-
+    # ---------------------------
+    # debug utils
+    # ---------------------------
     def _log_debug(self, kind: str, **fields: Any) -> None:
         if not self.debug_enabled:
             return
-        rec = {
-            "ts": time.time(),
-            "kind": kind,
-            "schema_id": self.schema_id,
-            "model_version": self.model_version,
-            **fields,
-        }
+        rec = {"ts": time.time(), "kind": kind, "schema_id": self.schema_id, "model_version": self.model_version, **fields}
         try:
             with self.model_api_log.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         except Exception:
             pass
 
-    def _schema_coverage_from_sample(self, sample: Dict[str, Any]) -> Dict[str, Any]:
-        keys = list(sample.keys())
+    def _schema_coverage(self, row_like: Dict[str, Any]) -> Dict[str, Any]:
+        keys = list(row_like.keys())
         strict_set = set(keys)
 
         norm_keys = {_norm_col(k) for k in keys}
@@ -212,41 +193,6 @@ class FusionService:
             "missing_norm_top": missing_norm[:20],
         }
 
-    def _ae_top_feature_errors(
-        self,
-        recon: torch.Tensor,
-        target: torch.Tensor,
-        mask: torch.Tensor,
-        topn: int = 8,
-    ) -> List[Dict[str, Any]]:
-        """
-        AE가 튀는 원인을 빠르게 찾기 위한 feature attribution.
-        - feature별 MSE(시간축 평균)를 계산하고 큰 순서대로 topn을 리턴.
-        """
-        # recon/target: [1,L,D], mask: [1,L]
-        with torch.no_grad():
-            m = (mask > 0).float().unsqueeze(-1)  # [1,L,1]
-            diff2 = (recon - target) ** 2
-            diff2 = diff2 * m
-            denom = torch.clamp(m.sum(dim=1), min=1.0)  # [1,1]
-            feat_mse = diff2.sum(dim=1) / denom  # [1,D]
-            feat_mse = feat_mse[0].detach().cpu().numpy()  # [D]
-
-        names = list(self.numeric_cols) + [
-            "win_log_unique_src",
-            "win_log_avg_flows_per_src",
-            "win_src_entropy_norm",
-            "win_log_duration",
-            "win_log_flow_rate",
-        ]
-
-        idx = np.argsort(-feat_mse)[: max(1, int(topn))]
-        out = []
-        for j in idx:
-            name = names[j] if j < len(names) else f"feat_{j}"
-            out.append({"feature": name, "mse": float(feat_mse[j])})
-        return out
-
     @torch.no_grad()
     def ingest_flows_and_send(
         self,
@@ -265,39 +211,22 @@ class FusionService:
         if request_id is None:
             request_id = str(flows[0].get("_debug_request_id") or uuid.uuid4())
 
-        raw_cov = self._schema_coverage_from_sample(flows[0])
+        # (A) raw 기준 커버리지
+        raw_cov = self._schema_coverage(flows[0])
         self._log_debug("ingest_begin", request_id=request_id, input_flows=len(flows), **raw_cov)
 
-        rows = self.prep.transform(flows, drop_label=drop_label)
+        # (B) rename/drop만 적용한 뒤 커버리지 (✅ 이게 “rename이 맞는지” 핵심)
+        renamed0 = rename_and_clean_only(flows[0], drop_label=drop_label)
+        ren_cov = self._schema_coverage(renamed0)
+        self._log_debug("after_rename_schema", request_id=request_id, **ren_cov)
 
-        if rows:
-            post_cov = self._schema_coverage_from_sample(rows[0])
-            self._log_debug("after_preprocess_schema", request_id=request_id, **post_cov)
+        # 1) preprocess (학습 규칙 재현 + row단 debug)
+        rows = self.prep.transform(flows, drop_label=drop_label, attach_debug=True)
 
-        try:
-            n = max(1, len(rows))
-            sport_other = sum(1 for r in rows if int(r.get("sport_idx", self.other_port_idx)) == self.other_port_idx) / n
-            dport_other = sum(1 for r in rows if int(r.get("dport_idx", self.other_port_idx)) == self.other_port_idx) / n
-            proto_other = sum(1 for r in rows if int(r.get("proto_idx", self.other_proto_idx)) == self.other_proto_idx) / n
-
-            ts_1970 = sum(
-                1 for r in rows
-                if isinstance(r.get("Timestamp"), pd.Timestamp) and r.get("Timestamp") <= pd.Timestamp("1970-01-01 00:00:01")
-            ) / n
-
-            self._log_debug(
-                "after_preprocess",
-                request_id=request_id,
-                sport_other_ratio=float(sport_other),
-                dport_other_ratio=float(dport_other),
-                proto_other_ratio=float(proto_other),
-                ts_1970_ratio=float(ts_1970),
-            )
-        except Exception:
-            pass
-
+        # 2) buffer add
         self.winbuf.add_flows(rows)
 
+        # 3) pop windows
         windows: List[WindowItem] = self.winbuf.pop_windows(force_flush=force_flush, min_flush_len=min_flush_len)
         if max_windows is not None:
             windows = windows[:max_windows]
@@ -317,78 +246,53 @@ class FusionService:
 
             if int(w.real_len) < self.min_real_len:
                 dropped_windows += 1
-                self._log_debug(
-                    "window_dropped",
-                    request_id=request_id,
-                    dst_ip=w.dst_ip,
-                    real_len=int(w.real_len),
-                    min_real_len=self.min_real_len,
-                    force_flush=bool(force_flush),
-                    min_flush_len=int(min_flush_len),
-                )
+                self._log_debug("window_dropped", request_id=request_id, dst_ip=w.dst_ip, real_len=int(w.real_len), min_real_len=self.min_real_len)
                 if not self.send_dropped_windows:
                     continue
-
-                events.append({
-                    "dst_ip": w.dst_ip,
-                    "real_len": int(w.real_len),
-                    "decision": {"source": "DROP", "attack": False, "attack_types": [], "reason": "too_short"},
-                    "meta": {
-                        "seq_len": self.seq_len,
-                        "stride": self.stride,
-                        "ts": time.time(),
-                        "request_id": request_id,
-                        "schema_id": self.schema_id,
-                        "config_sha256": self.config_sha256,
-                        "numeric_cols_hash": self.numeric_cols_hash,
-                        "model_version": self.model_version,
-                    },
-                })
+                events.append(
+                    {
+                        "dst_ip": w.dst_ip,
+                        "real_len": int(w.real_len),
+                        "decision": {"source": "DROP", "attack": False, "attack_types": [], "reason": "too_short"},
+                        "meta": {
+                            "seq_len": self.seq_len,
+                            "stride": self.stride,
+                            "ts": time.time(),
+                            "request_id": request_id,
+                            "schema_id": self.schema_id,
+                            "config_sha256": self.config_sha256,
+                            "numeric_cols_hash": self.numeric_cols_hash,
+                            "model_version": self.model_version,
+                        },
+                    }
+                )
                 continue
 
             numeric, cat, mask, win_dbg = self._build_window_tensors(w)
 
             # ---- TCN ----
-            logits = self.tcn_model(numeric, cat, mask)  # [1, C]
-            probs = torch.sigmoid(logits)[0]             # [C]
-            preds = (probs >= 0.5)
+            logits = self.tcn_model(numeric, cat, mask)
+            probs = torch.sigmoid(logits)[0]
+            preds = probs >= 0.5
 
             k = min(3, self.num_classes)
             topv, topi = torch.topk(probs, k=k)
-            topk = [
-                {"idx": int(i.item()), "label": self.label_classes[int(i.item())], "prob": float(v.item())}
-                for v, i in zip(topv, topi)
-            ]
+            topk = [{"idx": int(i.item()), "label": self.label_classes[int(i.item())], "prob": float(v.item())} for v, i in zip(topv, topi)]
 
-            tcn_attack_classes = [
-                self.label_classes[j]
-                for j in range(1, self.num_classes)
-                if bool(preds[j].item())
-            ]
+            tcn_attack_classes = [self.label_classes[j] for j in range(1, self.num_classes) if bool(preds[j].item())]
             tcn_attack_any = len(tcn_attack_classes) > 0
 
             # ---- AE ----
             ae_used = False
             ae_score = None
             ae_attack = False
-            ae_top_features: Optional[List[Dict[str, Any]]] = None
 
             if not tcn_attack_any:
                 recon = self.ae_model(numeric, cat, mask)
-                scores = compute_ae_scores(
-                    recon=recon,
-                    target=numeric,
-                    mask=mask,
-                    agg_mode=self.ae_agg_mode,
-                    topk=self.ae_topk,
-                )
+                scores = compute_ae_scores(recon=recon, target=numeric, mask=mask, agg_mode=self.ae_agg_mode, topk=self.ae_topk)
                 ae_score = float(scores[0].item())
                 ae_used = True
                 ae_attack = ae_score >= self.ae_threshold
-
-                # ★ 여기 핵심: 어떤 feature가 에러를 키웠는지
-                if self.splunk_debug_meta:
-                    ae_top_features = self._ae_top_feature_errors(recon=recon, target=numeric, mask=mask, topn=8)
 
             # ---- decision ----
             if tcn_attack_any:
@@ -396,11 +300,7 @@ class FusionService:
                     "source": "TCN",
                     "attack": True,
                     "attack_types": tcn_attack_classes,
-                    "confidence": {
-                        self.label_classes[j]: float(probs[j].item())
-                        for j in range(1, self.num_classes)
-                        if bool(preds[j].item())
-                    },
+                    "confidence": {self.label_classes[j]: float(probs[j].item()) for j in range(1, self.num_classes) if bool(preds[j].item())},
                     "topk": topk,
                 }
                 tcn_attack_windows += 1
@@ -419,14 +319,20 @@ class FusionService:
             else:
                 decision = {"source": "NONE", "attack": False, "attack_types": [], "topk": topk}
 
+            # ✅ row단 debug(결정적인 원인: missing/impute)
+            # 윈도우 내 row들의 impute 통계 요약
+            imputed_ratios = [float(r.get("_debug_imputed_ratio", 0.0)) for r in w.rows]
+            miss_ns = [int(r.get("_debug_missing_n", 0)) for r in w.rows]
+            imp_ns = [int(r.get("_debug_imputed_n", 0)) for r in w.rows]
+
+            imp_ratio_mean = float(np.mean(imputed_ratios)) if imputed_ratios else 0.0
+            miss_n_mean = float(np.mean(miss_ns)) if miss_ns else 0.0
+            imp_n_mean = float(np.mean(imp_ns)) if imp_ns else 0.0
+
+            # pipeline에서 넣은 trace 수집
             pcap_sources = sorted({str(r.get("_debug_pcap")) for r in w.rows if r.get("_debug_pcap")})[:3]
             csv_sources = sorted({str(r.get("_debug_csv")) for r in w.rows if r.get("_debug_csv")})[:3]
             header_hash = sorted({str(r.get("_debug_header_hash")) for r in w.rows if r.get("_debug_header_hash")})[:3]
-            schema_cov = None
-            try:
-                schema_cov = float(next((r.get("_debug_schema_cov") for r in w.rows if r.get("_debug_schema_cov") is not None), None))
-            except Exception:
-                schema_cov = None
 
             meta = {
                 "seq_len": self.seq_len,
@@ -441,28 +347,17 @@ class FusionService:
             }
 
             if self.splunk_debug_meta:
-                # 전처리 impute 비율(윈도우 평균)
-                try:
-                    imr = [float(r.get("_debug_imputed_ratio", 0.0)) for r in w.rows]
-                    impute_ratio_mean = float(np.mean(imr)) if imr else 0.0
-                except Exception:
-                    impute_ratio_mean = 0.0
-
                 meta["debug"] = {
-                    "schema_cov": schema_cov,
                     "pcap": pcap_sources,
                     "csv": csv_sources,
                     "header_hash": header_hash,
-                    "win": {**win_dbg, "impute_ratio_mean": impute_ratio_mean},
-                    "ae_top_features": ae_top_features,  # ★ 추가
+                    "win": win_dbg,
+                    "imputer_ratio_mean": imp_ratio_mean,
+                    "missing_n_mean": miss_n_mean,
+                    "imputed_n_mean": imp_n_mean,
                 }
 
-            events.append({
-                "dst_ip": w.dst_ip,
-                "real_len": int(w.real_len),
-                "decision": decision,
-                "meta": meta,
-            })
+            events.append({"dst_ip": w.dst_ip, "real_len": int(w.real_len), "decision": decision, "meta": meta})
 
             if wi < self.debug_windows:
                 self._log_debug(
@@ -475,6 +370,9 @@ class FusionService:
                     attack=bool(decision.get("attack")),
                     attack_types=decision.get("attack_types"),
                     win=win_dbg,
+                    imputer_ratio_mean=imp_ratio_mean,
+                    missing_n_mean=miss_n_mean,
+                    imputed_n_mean=imp_n_mean,
                     ae_score=ae_score,
                 )
 
@@ -527,7 +425,6 @@ class FusionService:
             except Exception:
                 pass
 
-        # base numeric [real_len, 77]
         base = np.zeros((real_len, len(self.numeric_cols)), dtype=np.float32)
         for i, r in enumerate(rows):
             for j, c in enumerate(self.numeric_cols):
@@ -536,7 +433,6 @@ class FusionService:
                 except Exception:
                     base[i, j] = 0.0
 
-        # window features (5)
         total_flows = float(real_len)
 
         src_vals = [r.get("Source IP") for r in rows if r.get("Source IP") is not None]
@@ -576,7 +472,7 @@ class FusionService:
 
         win_feat = np.array([f1, f2, f3, f4, f5], dtype=np.float32)
         win_feat_real = np.repeat(win_feat[None, :], real_len, axis=0)
-        numeric_real = np.concatenate([base, win_feat_real], axis=1)  # [real_len, 82]
+        numeric_real = np.concatenate([base, win_feat_real], axis=1)
 
         numeric = np.zeros((L, numeric_real.shape[1]), dtype=np.float32)
         numeric[:real_len] = numeric_real
