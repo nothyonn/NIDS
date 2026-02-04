@@ -5,7 +5,6 @@ import hashlib
 import json
 import math
 import os
-import re
 import time
 import uuid
 from pathlib import Path
@@ -53,21 +52,6 @@ def _norm_col(c: str) -> str:
     return c
 
 
-def _canon_col(c: str) -> str:
-    """
-    rename/debug에서 "진짜" 스키마 매칭을 보기 위한 canonical key.
-    - lower
-    - 알파넘/숫자 외 문자는 공백 처리(underscore, slash, dot, 괄호 등 전부 흡수)
-    - 공백 collapse
-    """
-    if c is None:
-        return ""
-    s = str(c).replace("\ufeff", "").strip().lower()
-    s = re.sub(r"[^a-z0-9]+", " ", s)
-    s = " ".join(s.split())
-    return s
-
-
 class FusionService:
     def __init__(
         self,
@@ -78,7 +62,7 @@ class FusionService:
         seq_len: int = 128,
         stride: int = 64,
         device: Optional[str] = None,
-        ae_threshold: float = 1.5624,
+        ae_threshold: float = 1.5624,   # top3 p95
         ae_agg_mode: str = "topk",
         ae_topk: int = 3,
         max_buffer_per_dst: int = 5000,
@@ -107,6 +91,7 @@ class FusionService:
         self.sort_by_timestamp = os.getenv("SORT_ROWS_BY_TIMESTAMP", "1") == "1"
         self.send_dropped_windows = os.getenv("SEND_DROPPED_WINDOWS", "0") == "1"
 
+        # 학습 규칙: 패딩 과다 윈도우 drop
         self.min_real_ratio = float(os.getenv("MIN_REAL_RATIO", "0.3"))
         self.min_real_len = max(1, int(math.ceil(self.seq_len * self.min_real_ratio)))
 
@@ -176,40 +161,32 @@ class FusionService:
         print("  model_version :", self.model_version)
 
     # ---------------------------
-    # schema (FastAPI /schema 엔드포인트용)
+    # schema / debug utils
     # ---------------------------
     def get_schema(self) -> Dict[str, Any]:
+        # ✅ app.py의 /schema가 이걸 호출함 (없어서 AttributeError 났던 것)
         return {
             "schema_id": self.schema_id,
-            "model_version": self.model_version,
             "config_sha256": self.config_sha256,
             "numeric_cols_hash": self.numeric_cols_hash,
             "numeric_cols": self.numeric_cols,
             "label_classes": self.label_classes,
+            "other_port_idx": self.other_port_idx,
+            "other_proto_idx": self.other_proto_idx,
             "seq_len": self.seq_len,
             "stride": self.stride,
-            "min_real_ratio": self.min_real_ratio,
             "min_real_len": self.min_real_len,
+            "min_real_ratio": self.min_real_ratio,
+            "model_version": self.model_version,
             "ae_threshold": self.ae_threshold,
             "ae_agg_mode": self.ae_agg_mode,
             "ae_topk": self.ae_topk,
-            "other_port_idx": self.other_port_idx,
-            "other_proto_idx": self.other_proto_idx,
         }
 
-    # ---------------------------
-    # debug utils
-    # ---------------------------
     def _log_debug(self, kind: str, **fields: Any) -> None:
         if not self.debug_enabled:
             return
-        rec = {
-            "ts": time.time(),
-            "kind": kind,
-            "schema_id": self.schema_id,
-            "model_version": self.model_version,
-            **fields,
-        }
+        rec = {"ts": time.time(), "kind": kind, "schema_id": self.schema_id, "model_version": self.model_version, **fields}
         try:
             with self.model_api_log.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -220,23 +197,21 @@ class FusionService:
         keys = list(row_like.keys())
         strict_set = set(keys)
 
-        # strict: exact match
+        norm_keys = {_norm_col(k) for k in keys}
+        norm_numeric = {_norm_col(c) for c in self.numeric_cols}
+
         strict_inter = strict_set & set(self.numeric_cols)
+        norm_inter = norm_keys & norm_numeric
+        missing_norm = sorted(list(norm_numeric - norm_keys))
+
         cov_strict = len(strict_inter) / len(self.numeric_cols) if self.numeric_cols else 0.0
-
-        # canon: case/underscore/slash/dot 차이까지 흡수해서 match
-        canon_keys = {_canon_col(k) for k in keys}
-        canon_numeric = {_canon_col(c) for c in self.numeric_cols}
-        canon_inter = canon_keys & canon_numeric
-        missing_canon = sorted(list(canon_numeric - canon_keys))
-
-        cov_canon = len(canon_inter) / len(self.numeric_cols) if self.numeric_cols else 0.0
+        cov_norm = len(norm_inter) / len(self.numeric_cols) if self.numeric_cols else 0.0
 
         return {
             "cov_strict": float(cov_strict),
-            "cov_norm": float(cov_canon),  # 기존 필드명 유지
-            "missing_norm_n": int(len(missing_canon)),
-            "missing_norm_top": missing_canon[:20],
+            "cov_norm": float(cov_norm),
+            "missing_norm_n": int(len(missing_norm)),
+            "missing_norm_top": missing_norm[:20],
         }
 
     @torch.no_grad()
@@ -261,7 +236,7 @@ class FusionService:
         raw_cov = self._schema_coverage(flows[0])
         self._log_debug("ingest_begin", request_id=request_id, input_flows=len(flows), **raw_cov)
 
-        # (B) rename/drop만 적용한 뒤 커버리지 (rename 맞는지 핵심)
+        # (B) rename/drop만 적용한 뒤 커버리지 (rename 맞는지 핵심 체크)
         renamed0 = self.prep.rename_and_clean_only(flows[0], drop_label=drop_label)
         ren_cov = self._schema_coverage(renamed0)
         self._log_debug("after_rename_schema", request_id=request_id, **ren_cov)
@@ -306,12 +281,7 @@ class FusionService:
                     {
                         "dst_ip": w.dst_ip,
                         "real_len": int(w.real_len),
-                        "decision": {
-                            "source": "DROP",
-                            "attack": False,
-                            "attack_types": [],
-                            "reason": "too_short",
-                        },
+                        "decision": {"source": "DROP", "attack": False, "attack_types": [], "reason": "too_short"},
                         "meta": {
                             "seq_len": self.seq_len,
                             "stride": self.stride,
@@ -335,20 +305,9 @@ class FusionService:
 
             k = min(3, self.num_classes)
             topv, topi = torch.topk(probs, k=k)
-            topk = [
-                {
-                    "idx": int(i.item()),
-                    "label": self.label_classes[int(i.item())],
-                    "prob": float(v.item()),
-                }
-                for v, i in zip(topv, topi)
-            ]
+            topk = [{"idx": int(i.item()), "label": self.label_classes[int(i.item())], "prob": float(v.item())} for v, i in zip(topv, topi)]
 
-            tcn_attack_classes = [
-                self.label_classes[j]
-                for j in range(1, self.num_classes)
-                if bool(preds[j].item())
-            ]
+            tcn_attack_classes = [self.label_classes[j] for j in range(1, self.num_classes) if bool(preds[j].item())]
             tcn_attack_any = len(tcn_attack_classes) > 0
 
             # ---- AE ----
@@ -356,15 +315,10 @@ class FusionService:
             ae_score = None
             ae_attack = False
 
+            # ✅ 설계 그대로: TCN이 benign이면 AE로 2차 검사
             if not tcn_attack_any:
                 recon = self.ae_model(numeric, cat, mask)
-                scores = compute_ae_scores(
-                    recon=recon,
-                    target=numeric,
-                    mask=mask,
-                    agg_mode=self.ae_agg_mode,
-                    topk=self.ae_topk,
-                )
+                scores = compute_ae_scores(recon=recon, target=numeric, mask=mask, agg_mode=self.ae_agg_mode, topk=self.ae_topk)
                 ae_score = float(scores[0].item())
                 ae_used = True
                 ae_attack = ae_score >= self.ae_threshold
@@ -375,11 +329,7 @@ class FusionService:
                     "source": "TCN",
                     "attack": True,
                     "attack_types": tcn_attack_classes,
-                    "confidence": {
-                        self.label_classes[j]: float(probs[j].item())
-                        for j in range(1, self.num_classes)
-                        if bool(preds[j].item())
-                    },
+                    "confidence": {self.label_classes[j]: float(probs[j].item()) for j in range(1, self.num_classes) if bool(preds[j].item())},
                     "topk": topk,
                 }
                 tcn_attack_windows += 1
@@ -398,7 +348,7 @@ class FusionService:
             else:
                 decision = {"source": "NONE", "attack": False, "attack_types": [], "topk": topk}
 
-            # ✅ row단 debug(결정적인 원인: missing/impute)
+            # ---- debug meta (원인 추적용, 모델 입력에는 영향 없음) ----
             imputed_ratios = [float(r.get("_debug_imputed_ratio", 0.0)) for r in w.rows]
             miss_ns = [int(r.get("_debug_missing_n", 0)) for r in w.rows]
             imp_ns = [int(r.get("_debug_imputed_n", 0)) for r in w.rows]
@@ -407,7 +357,6 @@ class FusionService:
             miss_n_mean = float(np.mean(miss_ns)) if miss_ns else 0.0
             imp_n_mean = float(np.mean(imp_ns)) if imp_ns else 0.0
 
-            # pipeline에서 넣은 trace 수집
             pcap_sources = sorted({str(r.get("_debug_pcap")) for r in w.rows if r.get("_debug_pcap")})[:3]
             csv_sources = sorted({str(r.get("_debug_csv")) for r in w.rows if r.get("_debug_csv")})[:3]
             header_hash = sorted({str(r.get("_debug_header_hash")) for r in w.rows if r.get("_debug_header_hash")})[:3]
@@ -435,14 +384,7 @@ class FusionService:
                     "imputed_n_mean": imp_n_mean,
                 }
 
-            events.append(
-                {
-                    "dst_ip": w.dst_ip,
-                    "real_len": int(w.real_len),
-                    "decision": decision,
-                    "meta": meta,
-                }
-            )
+            events.append({"dst_ip": w.dst_ip, "real_len": int(w.real_len), "decision": decision, "meta": meta})
 
             if wi < self.debug_windows:
                 self._log_debug(
@@ -487,9 +429,8 @@ class FusionService:
             "sent_events": sent_events,
         }
 
-    def _build_window_tensors(
-        self, w: WindowItem
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
+    def _build_window_tensors(self, w: WindowItem) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
+        # ts_nonmono는 "정렬 전" 원본 순서에서 측정
         orig_ts = [r.get("Timestamp") for r in w.rows if r.get("Timestamp") is not None]
         ts_nonmono = 0.0
         if len(orig_ts) >= 2:
@@ -508,11 +449,7 @@ class FusionService:
 
         if self.sort_by_timestamp:
             try:
-                rows.sort(
-                    key=lambda r: r.get("Timestamp")
-                    if r.get("Timestamp") is not None
-                    else pd.Timestamp("1970-01-01")
-                )
+                rows.sort(key=lambda r: r.get("Timestamp") if r.get("Timestamp") is not None else pd.Timestamp("1970-01-01"))
             except Exception:
                 pass
 
