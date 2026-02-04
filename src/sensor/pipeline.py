@@ -42,7 +42,7 @@ def _sha256_text(s: str) -> str:
 
 def _disambiguate_header_like_pandas(raw_header: List[str]) -> List[str]:
     """
-    ⚠️ 중요:
+    중요:
     - DictReader는 중복 헤더를 dict 키로 만들 때 덮어써서 feature가 사라질 수 있음.
     - pandas는 중복 헤더를 .1, .2 ... 로 살려둠.
     => 센서도 pandas 방식으로 중복 헤더를 보존해서 학습 스키마와 동일하게 맞춤.
@@ -63,6 +63,7 @@ def _disambiguate_header_like_pandas(raw_header: List[str]) -> List[str]:
 def read_csv_rows(csv_path: Path) -> Tuple[List[Dict], List[str], str, List[str]]:
     """
     CICFlowMeter CSV를 row dict 리스트로 읽음(헤더 기반).
+    - 여기서 절대 값 전처리(스케일링/NaN/Infinity 처리) 하지 않음.
     returns: (rows, header_cols, header_hash, dup_bases)
     """
     rows: List[Dict] = []
@@ -73,21 +74,29 @@ def read_csv_rows(csv_path: Path) -> Tuple[List[Dict], List[str], str, List[str]
 
         dup_bases = sorted({c.rsplit(".", 1)[0] for c in header if re.search(r"\.\d+$", c)})
 
-        # DictReader가 이 header를 사용하도록 강제
+        # DictReader가 이 header를 사용하도록 강제 (중복키 덮어쓰기 방지)
         reader.fieldnames = header
 
         for r in reader:
-            rr = {(_norm_col(k) if k else k): (v.strip() if isinstance(v, str) else v) for k, v in r.items()}
-            rows.append(rr)
+            rr: Dict = {}
+            for k, v in r.items():
+                kk = _norm_col(k) if k else k
+                if isinstance(v, str):
+                    rr[kk] = v.strip()
+                else:
+                    rr[kk] = v
+            # 빈 행 제거(가끔 CICFlowMeter가 마지막에 빈 줄 뱉음)
+            if any(v not in (None, "", " ") for v in rr.values()):
+                rows.append(rr)
 
     header_hash = _sha256_text("\n".join(header))[:16]
     return rows, header, header_hash, dup_bases
 
 
-def fetch_model_schema(model_url: str, timeout_sec: float = 3.0) -> Optional[Dict]:
+def fetch_model_schema(model_url: str, timeout_sec: float = 3.0, *, verify_ssl: bool = False) -> Optional[Dict]:
     try:
         url = f"{model_url.rstrip('/')}/schema"
-        r = requests.get(url, timeout=timeout_sec)
+        r = requests.get(url, timeout=timeout_sec, verify=verify_ssl)
         if r.status_code != 200:
             return None
         return r.json()
@@ -118,6 +127,7 @@ def post_ingest(
     *,
     request_id: str,
     timeout_sec: int = 180,
+    verify_ssl: bool = False,
 ) -> requests.Response:
     url = f"{model_url.rstrip('/')}/ingest"
     payload = {
@@ -125,7 +135,7 @@ def post_ingest(
         "request_id": request_id,
         "drop_label": True,  # live flow엔 Label 없으니 드랍
     }
-    return requests.post(url, json=payload, timeout=timeout_sec)
+    return requests.post(url, json=payload, timeout=timeout_sec, verify=verify_ssl)
 
 
 def run_cicflowmeter_v3_for_one_pcap(
@@ -137,10 +147,16 @@ def run_cicflowmeter_v3_for_one_pcap(
     work_in_dir: Path,
     log_path: Path,
 ) -> List[Path]:
+    """
+    너의 CICFlowMeterV3 실행 방식 유지.
+    - work_in_dir 에 pcap을 복사하고
+    - CICFlowMeter가 work_in_dir 전체를 처리해서 out_dir에 csv 생성
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
     work_in_dir.mkdir(parents=True, exist_ok=True)
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # 이전 workdir pcap 제거 (혼합 방지)
     for x in work_in_dir.glob("*.pcap"):
         x.unlink(missing_ok=True)
 
@@ -164,11 +180,19 @@ def run_cicflowmeter_v3_for_one_pcap(
 
     with log_path.open("a", encoding="utf-8") as lf:
         lf.write(f"\n=== CICFlowMeter run: {pcap_file} @ {time.strftime('%F %T')} ===\n")
+        lf.write("CMD: " + " ".join(cmd) + "\n")
         lf.flush()
         subprocess.run(cmd, check=True, env=env, stdout=lf, stderr=lf)
 
     after = set(out_dir.glob("*.csv"))
     new_csvs = sorted(after - before)
+
+    # 만약 파일명이 overwrite되어 set diff가 0이 되는 경우 대비(최후방어):
+    if not new_csvs:
+        # 최근 수정된 csv 몇 개를 주워온다(매우 보수적으로 3개)
+        candidates = sorted(out_dir.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
+        new_csvs = candidates[:3]
+
     return new_csvs
 
 
@@ -194,8 +218,13 @@ def main():
 
     # model
     ap.add_argument("--model-url", required=True)
-    ap.add_argument("--schema-check", action="store_true", default=True, help="model /schema로 스키마 비교 로그(기본 ON)")
+
+    # schema check: 기본 ON, 필요하면 --no-schema-check로 끔
+    ap.add_argument("--no-schema-check", action="store_true", help="model /schema 비교 로그 끄기")
     ap.add_argument("--schema-timeout", type=float, default=3.0)
+
+    # SSL verify (기본 False: 내부망 self-signed 환경에서 경고/실패 방지)
+    ap.add_argument("--verify-ssl", action="store_true", help="requests SSL verify 켜기(기본 OFF)")
 
     # pipeline behavior
     ap.add_argument("--pcap-glob", default="*.pcap")
@@ -212,7 +241,11 @@ def main():
 
     # safety
     ap.add_argument("--seen-max", type=int, default=5000)
+
     args = ap.parse_args()
+
+    verify_ssl = bool(args.verify_ssl)
+    schema_check = not bool(args.no_schema_check)
 
     pcap_dir = Path(args.pcap_dir)
     flows_dir = Path(args.flows_dir)
@@ -257,12 +290,12 @@ def main():
 
     def get_schema_cached() -> Optional[Dict]:
         nonlocal schema_cache, schema_cache_ts
-        if not args.schema_check:
+        if not schema_check:
             return None
         now = time.time()
         if schema_cache is not None and (now - schema_cache_ts) < schema_ttl:
             return schema_cache
-        schema_cache = fetch_model_schema(args.model_url, timeout_sec=float(args.schema_timeout))
+        schema_cache = fetch_model_schema(args.model_url, timeout_sec=float(args.schema_timeout), verify_ssl=verify_ssl)
         schema_cache_ts = now
         return schema_cache
 
@@ -279,7 +312,7 @@ def main():
     log(f"model_url={args.model_url}")
     log(f"batch_rows={args.batch_rows} flush_interval={args.flush_interval}s max_request_rows={args.max_request_rows}")
     log(f"poll_sec={args.poll_sec} stable_wait_sec={args.stable_wait_sec}")
-    log(f"schema_check={bool(args.schema_check)} schema_timeout={args.schema_timeout}s")
+    log(f"schema_check={bool(schema_check)} schema_timeout={args.schema_timeout}s verify_ssl={verify_ssl}")
 
     while True:
         pcaps = sorted(pcap_dir.glob(args.pcap_glob))
@@ -373,18 +406,21 @@ def main():
             else:
                 parts = [send_now]
 
-            request_id = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
+            base_request_id = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
 
-            for part in parts:
+            for part_idx, part in enumerate(parts):
                 if not part:
                     continue
-                # HTTP 요청 단위 request_id를 모든 flow에 동일하게 박아서 모델/스플렁크/로그 연결
+
+                # part별 request_id (base 유지 + suffix)
+                request_id = f"{base_request_id}-p{part_idx}"
+
                 for r in part:
                     r["_debug_request_id"] = request_id
 
                 try:
-                    r = post_ingest(args.model_url, part, request_id=request_id, timeout_sec=180)
-                    log(f"ingest ok: req_id={request_id} sent={len(part)} status={r.status_code} body={r.text[:200]}")
+                    resp = post_ingest(args.model_url, part, request_id=request_id, timeout_sec=180, verify_ssl=verify_ssl)
+                    log(f"ingest ok: req_id={request_id} sent={len(part)} status={resp.status_code} body={resp.text[:200]}")
                 except Exception as e:
                     buffer = part + buffer
                     log(f"ingest FAIL: req_id={request_id} err={e} (requeued {len(part)})")
@@ -395,12 +431,12 @@ def main():
 
         if args.once:
             if buffer:
-                request_id = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
+                request_id = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}-final"
                 for r in buffer:
                     r["_debug_request_id"] = request_id
                 try:
-                    r = post_ingest(args.model_url, buffer, request_id=request_id, timeout_sec=180)
-                    log(f"final flush ok: req_id={request_id} sent={len(buffer)} status={r.status_code} body={r.text[:200]}")
+                    resp = post_ingest(args.model_url, buffer, request_id=request_id, timeout_sec=180, verify_ssl=verify_ssl)
+                    log(f"final flush ok: req_id={request_id} sent={len(buffer)} status={resp.status_code} body={resp.text[:200]}")
                 except Exception as e:
                     log(f"final flush FAIL: req_id={request_id} err={e}")
             log("once mode done. exit.")
