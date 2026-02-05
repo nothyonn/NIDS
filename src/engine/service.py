@@ -95,6 +95,10 @@ class FusionService:
         self.min_real_ratio = float(os.getenv("MIN_REAL_RATIO", "0.3"))
         self.min_real_len = max(1, int(math.ceil(self.seq_len * self.min_real_ratio)))
 
+        # ✅ 하드코딩: Timestamp가 같은 값으로 뭉쳐 duration이 0에 수렴할 때 flow_rate 폭발 방지
+        #    (0.05보다 1.0이 안전: 초 단위 타임스탬프에서 1e-06 같은 값이 나오며 폭발하는 케이스를 강하게 억제)
+        self.min_win_duration_s = 1.0
+
         self.model_api_log = Path(os.getenv("MODEL_API_LOG", "/data/log/model_api.log"))
         self.model_api_log.parent.mkdir(parents=True, exist_ok=True)
 
@@ -431,7 +435,17 @@ class FusionService:
 
     def _build_window_tensors(self, w: WindowItem) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
         # ts_nonmono는 "정렬 전" 원본 순서에서 측정
-        orig_ts = [r.get("Timestamp") for r in w.rows if r.get("Timestamp") is not None]
+        orig_ts = []
+        for r in w.rows:
+            ts = r.get("Timestamp")
+            if ts is None or pd.isna(ts):
+                continue
+            if not isinstance(ts, pd.Timestamp):
+                ts = pd.to_datetime(ts, errors="coerce")
+            if ts is None or pd.isna(ts):
+                continue
+            orig_ts.append(ts)
+
         ts_nonmono = 0.0
         if len(orig_ts) >= 2:
             bad = 0
@@ -475,16 +489,28 @@ class FusionService:
         avg_flows_per_src = total_flows / unique_src if unique_src > 0 else 0.0
         src_ent_raw = _shannon_entropy(counts) if unique_src > 0 and len(counts) > 0 else 0.0
 
-        ts_list = [r.get("Timestamp") for r in rows if r.get("Timestamp") is not None]
+        # ✅ NaT/파싱 꼬임 제거 + duration 최소값(1초) 하드 클램프
+        ts_list: List[pd.Timestamp] = []
+        for r in rows:
+            ts = r.get("Timestamp")
+            if ts is None or pd.isna(ts):
+                continue
+            if not isinstance(ts, pd.Timestamp):
+                ts = pd.to_datetime(ts, errors="coerce")
+            if ts is None or pd.isna(ts):
+                continue
+            ts_list.append(ts)
+
         if ts_list:
             try:
                 t_min = min(ts_list)
                 t_max = max(ts_list)
-                window_duration = float(max((t_max - t_min).total_seconds(), 1e-6))
+                dur = (t_max - t_min).total_seconds()
+                window_duration = float(max(dur, self.min_win_duration_s))
             except Exception:
-                window_duration = 1e-6
+                window_duration = float(self.min_win_duration_s)
         else:
-            window_duration = 1e-6
+            window_duration = float(self.min_win_duration_s)
 
         flow_rate = total_flows / window_duration
 

@@ -252,11 +252,35 @@ class OnlinePreprocessor:
             row["Destination Port"] = self._to_int(dport, self.cfg.other_port_idx)
             row["Protocol"] = self._to_int(proto, self.cfg.proto_other_idx)
 
-            # 3) Timestamp 파싱 (없으면 epoch)
-            ts = row.get("Timestamp")
-            ts = pd.to_datetime(str(ts).strip(), errors="coerce") if ts is not None else pd.NaT
+            # 3) Timestamp 파싱 강화:
+            #    1) CICFlowMeter 대표 포맷 우선
+            #    2) 실패 시 일반 파싱
+            #    3) 그래도 실패면 센서 수집시각(_debug_sensor_ts)로 대체
+            #    4) 최후에 1970
+            ts_raw = row.get("Timestamp")
+            ts = pd.NaT
+
+            if ts_raw is not None:
+                s = str(ts_raw).strip()
+                if s:
+                    # CICFlowMeter 예: "12/01/2026 05:59:33 AM"
+                    ts = pd.to_datetime(s, format="%m/%d/%Y %I:%M:%S %p", errors="coerce")
+                    if pd.isna(ts):
+                        ts = pd.to_datetime(s, errors="coerce")
+
+            if pd.isna(ts):
+                sensor_ts = raw.get("_debug_sensor_ts", None)
+                if sensor_ts is None:
+                    sensor_ts = row.get("_debug_sensor_ts", None)
+                if sensor_ts is not None:
+                    try:
+                        ts = pd.to_datetime(float(sensor_ts), unit="s", errors="coerce")
+                    except Exception:
+                        ts = pd.NaT
+
             if pd.isna(ts):
                 ts = pd.Timestamp("1970-01-01")
+
             row["Timestamp"] = ts
 
             # 4) port/proto idx
