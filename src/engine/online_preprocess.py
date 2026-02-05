@@ -116,6 +116,11 @@ class OnlinePreprocessor:
     학습 파이프라인과 일치:
     - master_raw: 문자열 Infinity/NaN/inf 처리 + to_numeric(errors="coerce") 의도
     - second_preprocess: NaN -> median, scaling(mean/std)
+
+    + (배포 안정화 패치)
+    - 학습에서 사실상 상수(std가 극소)였던 컬럼 / Bulk 계열 컬럼은 실시간 튐값이 들어오면 z-score가 폭발함
+      => 해당 컬럼은 median으로 강제 고정(학습 분포 유지)
+    - scaling 결과 z-score clip으로 폭발값 방지
     """
 
     def __init__(self, config_path: str | Path):
@@ -174,6 +179,45 @@ class OnlinePreprocessor:
 
         if self._min_seg_target is not None:
             self.rename_map["Fwd Seg Size Min"] = self._min_seg_target
+
+        # ---------------------------
+        # 안정화 패치 설정
+        # ---------------------------
+        # z-score clip (폭발 방지)
+        self.z_clip = 10.0  # 하드코딩
+
+        # 학습에서 상수였던 컬럼 / Bulk 계열은 median으로 강제 고정
+        def _sf(x: Any, default: float) -> float:
+            try:
+                fv = float(x)
+                if not math.isfinite(fv):
+                    return default
+                return fv
+            except Exception:
+                return default
+
+        # Bulk 계열은 우선 강제로 포함 (학습/실시간 분포 mismatch로 자주 터짐)
+        bulk_like = {
+            "Fwd Avg Bytes/Bulk",
+            "Fwd Avg Packets/Bulk",
+            "Fwd Avg Bulk Rate",
+            "Bwd Avg Bytes/Bulk",
+            "Bwd Avg Packets/Bulk",
+            "Bwd Avg Bulk Rate",
+        }
+
+        self.force_zero_cols: set[str] = set()
+        self.force_zero_cols.update({c for c in bulk_like if c in nc})
+
+        # std가 극소인(사실상 상수) 컬럼도 강제 고정
+        # (학습 때 거의 변동이 없었던 피처는 실시간에서 값이 튀면 (x-mu)/sd가 폭발)
+        for c in self.cfg.numeric_cols:
+            sd = _sf(self.cfg.std.get(c, 1.0), 1.0)
+            if sd <= 1e-6 + 1e-12:
+                self.force_zero_cols.add(c)
+
+        # 디버그/재현성
+        self.force_zero_cols_sorted = sorted(self.force_zero_cols)
 
     def rename_and_clean_only(self, row_raw: Dict[str, Any], *, drop_label: bool) -> Dict[str, Any]:
         """
@@ -288,9 +332,10 @@ class OnlinePreprocessor:
             row["dport_idx"] = self._map_port(row["Destination Port"])
             row["proto_idx"] = self._map_proto(row["Protocol"])
 
-            # 5) numeric_cols: (Infinity/NaN/inf 처리) -> median -> scaling
+            # 5) numeric_cols: (Infinity/NaN/inf 처리) -> (force-zero) -> median -> scaling -> clip
             imputed_cols: List[str] = []
             missing_cols: List[str] = []
+            force_zero_applied: List[str] = []
 
             for c in num_cols:
                 if c not in row:
@@ -302,21 +347,39 @@ class OnlinePreprocessor:
                 if sd == 0:
                     sd = 1e-6
 
-                vraw = row.get(c, None)
-                fv = _coerce_nan_like(vraw)
-                if fv is None:
+                # ✅ 핵심: 학습에서 상수/민감 컬럼은 실시간 값 무시하고 median 고정
+                if c in self.force_zero_cols:
                     x = med
                     imputed_cols.append(c)
+                    force_zero_applied.append(c)
                 else:
-                    x = fv
+                    vraw = row.get(c, None)
+                    fv = _coerce_nan_like(vraw)
+                    if fv is None:
+                        x = med
+                        imputed_cols.append(c)
+                    else:
+                        x = fv
 
-                row[c] = (x - mu) / sd
+                z = (x - mu) / sd
+
+                # ✅ 폭발값 방지 clip
+                if z > self.z_clip:
+                    z = self.z_clip
+                elif z < -self.z_clip:
+                    z = -self.z_clip
+
+                row[c] = float(z)
 
             if attach_debug:
                 row["_debug_missing_numeric_cols"] = missing_cols[:debug_top_missing]
                 row["_debug_missing_n"] = int(len(missing_cols))
                 row["_debug_imputed_n"] = int(len(imputed_cols))
                 row["_debug_imputed_ratio"] = float(len(imputed_cols) / max(1, len(num_cols)))
+
+                # force-zero 디버그(폭발 원인 추적용)
+                row["_debug_force_zero_n"] = int(len(force_zero_applied))
+                row["_debug_force_zero_cols"] = force_zero_applied[:debug_top_missing]
 
             out.append(row)
 
