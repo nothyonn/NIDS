@@ -177,6 +177,66 @@ def chunked(lst: List[Dict], n: int):
         yield lst[i : i + n]
 
 
+def cleanup_pcaps(
+    *,
+    target_dir: Path,
+    retention_min: int,
+    keep_last: int,
+    log_fn,
+    patterns: Tuple[str, ...] = ("*.pcap", "*.pcap.gz"),
+) -> None:
+    """
+    target_dir에서 pcap을 정리:
+    - keep_last > 0 이면 최신 N개는 무조건 보존
+    - retention_min > 0 이면 mtime 기준으로 오래된 파일 삭제
+    """
+    if retention_min <= 0 and keep_last <= 0:
+        return
+
+    try:
+        files: List[Path] = []
+        for pat in patterns:
+            files.extend(list(target_dir.glob(pat)))
+        if not files:
+            return
+
+        files = sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)
+        keep_set = set()
+        if keep_last > 0:
+            for p in files[:keep_last]:
+                keep_set.add(p.resolve())
+
+        now = time.time()
+        deleted = 0
+        freed = 0
+
+        for p in files:
+            try:
+                rp = p.resolve()
+                if rp in keep_set:
+                    continue
+                st = p.stat()
+                age_min = (now - st.st_mtime) / 60.0
+                if retention_min > 0 and age_min <= float(retention_min):
+                    continue
+                size = st.st_size
+                p.unlink(missing_ok=True)
+                deleted += 1
+                freed += size
+            except FileNotFoundError:
+                continue
+            except Exception:
+                continue
+
+        if deleted:
+            log_fn(
+                f"cleanup_pcaps: dir={target_dir} deleted={deleted} freed={freed/1024/1024:.1f}MB "
+                f"retention_min={retention_min} keep_last={keep_last}"
+            )
+    except Exception:
+        return
+
+
 def main():
     ap = argparse.ArgumentParser()
 
@@ -209,6 +269,11 @@ def main():
     ap.add_argument("--keep-csv", action="store_true")
     ap.add_argument("--keep-pcap", action="store_true")
     ap.add_argument("--once", action="store_true")
+
+    # ✅ archive cleanup (pcap_done 폭주 방지)
+    ap.add_argument("--archive-retention-min", type=int, default=5, help="pcap_done에서 이 분(min)보다 오래된 pcap 삭제(0이면 비활성)")
+    ap.add_argument("--archive-keep-last", type=int, default=0, help="pcap_done 최신 N개는 보존(0이면 비활성)")
+    ap.add_argument("--cleanup-interval-sec", type=float, default=30.0, help="cleanup 실행 주기(초)")
 
     # safety
     ap.add_argument("--seen-max", type=int, default=5000)
@@ -280,8 +345,22 @@ def main():
     log(f"batch_rows={args.batch_rows} flush_interval={args.flush_interval}s max_request_rows={args.max_request_rows}")
     log(f"poll_sec={args.poll_sec} stable_wait_sec={args.stable_wait_sec}")
     log(f"schema_check={bool(args.schema_check)} schema_timeout={args.schema_timeout}s")
+    log(f"cleanup: archive_retention_min={args.archive_retention_min} keep_last={args.archive_keep_last} interval={args.cleanup_interval_sec}s")
+
+    next_cleanup_ts = 0.0
 
     while True:
+        # ✅ 주기적으로 pcap_done 정리
+        now0 = time.time()
+        if now0 >= next_cleanup_ts:
+            cleanup_pcaps(
+                target_dir=archive_dir,
+                retention_min=int(args.archive_retention_min),
+                keep_last=int(args.archive_keep_last),
+                log_fn=log,
+            )
+            next_cleanup_ts = now0 + float(args.cleanup_interval_sec)
+
         pcaps = sorted(pcap_dir.glob(args.pcap_glob))
 
         for pcap in pcaps:
@@ -378,7 +457,6 @@ def main():
             for part in parts:
                 if not part:
                     continue
-                # HTTP 요청 단위 request_id를 모든 flow에 동일하게 박아서 모델/스플렁크/로그 연결
                 for r in part:
                     r["_debug_request_id"] = request_id
 

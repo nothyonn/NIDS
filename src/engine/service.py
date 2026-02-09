@@ -62,7 +62,7 @@ class FusionService:
         seq_len: int = 128,
         stride: int = 64,
         device: Optional[str] = None,
-        ae_threshold: float = 1.5624,   # top3 p95
+        ae_threshold: float = 1.5624,   # (초기값) top3 p95
         ae_agg_mode: str = "topk",
         ae_topk: int = 3,
         max_buffer_per_dst: int = 5000,
@@ -76,7 +76,7 @@ class FusionService:
         self.stride = int(stride)
 
         self.ae_threshold = float(ae_threshold)
-        self.ae_agg_mode = ae_agg_mode
+        self.ae_agg_mode = str(ae_agg_mode)
         self.ae_topk = int(ae_topk)
 
         if device is None:
@@ -95,8 +95,7 @@ class FusionService:
         self.min_real_ratio = float(os.getenv("MIN_REAL_RATIO", "0.3"))
         self.min_real_len = max(1, int(math.ceil(self.seq_len * self.min_real_ratio)))
 
-        # ✅ 하드코딩: Timestamp가 같은 값으로 뭉쳐 duration이 0에 수렴할 때 flow_rate 폭발 방지
-        #    (0.05보다 1.0이 안전: 초 단위 타임스탬프에서 1e-06 같은 값이 나오며 폭발하는 케이스를 강하게 억제)
+        # Timestamp가 뭉쳐 duration≈0 -> flow_rate 폭발 방지
         self.min_win_duration_s = 1.0
 
         self.model_api_log = Path(os.getenv("MODEL_API_LOG", "/data/log/model_api.log"))
@@ -168,7 +167,6 @@ class FusionService:
     # schema / debug utils
     # ---------------------------
     def get_schema(self) -> Dict[str, Any]:
-        # ✅ app.py의 /schema가 이걸 호출함 (없어서 AttributeError 났던 것)
         return {
             "schema_id": self.schema_id,
             "config_sha256": self.config_sha256,
@@ -190,7 +188,13 @@ class FusionService:
     def _log_debug(self, kind: str, **fields: Any) -> None:
         if not self.debug_enabled:
             return
-        rec = {"ts": time.time(), "kind": kind, "schema_id": self.schema_id, "model_version": self.model_version, **fields}
+        rec = {
+            "ts": time.time(),
+            "kind": kind,
+            "schema_id": self.schema_id,
+            "model_version": self.model_version,
+            **fields,
+        }
         try:
             with self.model_api_log.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -240,12 +244,12 @@ class FusionService:
         raw_cov = self._schema_coverage(flows[0])
         self._log_debug("ingest_begin", request_id=request_id, input_flows=len(flows), **raw_cov)
 
-        # (B) rename/drop만 적용한 뒤 커버리지 (rename 맞는지 핵심 체크)
+        # (B) rename/drop만 적용한 뒤 커버리지
         renamed0 = self.prep.rename_and_clean_only(flows[0], drop_label=drop_label)
         ren_cov = self._schema_coverage(renamed0)
         self._log_debug("after_rename_schema", request_id=request_id, **ren_cov)
 
-        # 1) preprocess (학습 규칙 재현 + row단 debug)
+        # 1) preprocess
         rows = self.prep.transform(flows, drop_label=drop_label, attach_debug=True)
 
         # 2) buffer add
@@ -295,6 +299,7 @@ class FusionService:
                             "config_sha256": self.config_sha256,
                             "numeric_cols_hash": self.numeric_cols_hash,
                             "model_version": self.model_version,
+                            "ae_used": False,
                         },
                     }
                 )
@@ -307,22 +312,36 @@ class FusionService:
             probs = torch.sigmoid(logits)[0]
             preds = probs >= 0.5
 
+            benign_prob = float(probs[0].item()) if self.num_classes > 0 else 0.0
+
             k = min(3, self.num_classes)
             topv, topi = torch.topk(probs, k=k)
-            topk = [{"idx": int(i.item()), "label": self.label_classes[int(i.item())], "prob": float(v.item())} for v, i in zip(topv, topi)]
+            tcn_topk = [
+                {"idx": int(i.item()), "label": self.label_classes[int(i.item())], "prob": float(v.item())}
+                for v, i in zip(topv, topi)
+            ]
 
-            tcn_attack_classes = [self.label_classes[j] for j in range(1, self.num_classes) if bool(preds[j].item())]
+            tcn_attack_classes = [
+                self.label_classes[j]
+                for j in range(1, self.num_classes)
+                if bool(preds[j].item())
+            ]
             tcn_attack_any = len(tcn_attack_classes) > 0
 
-            # ---- AE ----
+            # ---- AE (TCN benign이면 항상 score 계산 + 이벤트에 남김) ----
             ae_used = False
-            ae_score = None
+            ae_score: Optional[float] = None
             ae_attack = False
 
-            # ✅ 설계 그대로: TCN이 benign이면 AE로 2차 검사
             if not tcn_attack_any:
                 recon = self.ae_model(numeric, cat, mask)
-                scores = compute_ae_scores(recon=recon, target=numeric, mask=mask, agg_mode=self.ae_agg_mode, topk=self.ae_topk)
+                scores = compute_ae_scores(
+                    recon=recon,
+                    target=numeric,
+                    mask=mask,
+                    agg_mode=self.ae_agg_mode,
+                    topk=self.ae_topk,
+                )
                 ae_score = float(scores[0].item())
                 ae_used = True
                 ae_attack = ae_score >= self.ae_threshold
@@ -333,10 +352,16 @@ class FusionService:
                     "source": "TCN",
                     "attack": True,
                     "attack_types": tcn_attack_classes,
-                    "confidence": {self.label_classes[j]: float(probs[j].item()) for j in range(1, self.num_classes) if bool(preds[j].item())},
-                    "topk": topk,
+                    "confidence": {
+                        self.label_classes[j]: float(probs[j].item())
+                        for j in range(1, self.num_classes)
+                        if bool(preds[j].item())
+                    },
+                    "topk": tcn_topk,
+                    "tcn_benign_prob": benign_prob,
                 }
                 tcn_attack_windows += 1
+
             elif ae_attack:
                 decision = {
                     "source": "AE",
@@ -345,14 +370,27 @@ class FusionService:
                     "ae_score": ae_score,
                     "ae_threshold": self.ae_threshold,
                     "agg_mode": self.ae_agg_mode,
-                    "topk": self.ae_topk,
-                    "tcn_topk": topk,
+                    "ae_topk": self.ae_topk,
+                    "tcn_topk": tcn_topk,
+                    "tcn_benign_prob": benign_prob,
                 }
                 ae_attack_windows += 1
-            else:
-                decision = {"source": "NONE", "attack": False, "attack_types": [], "topk": topk}
 
-            # ---- debug meta (원인 추적용, 모델 입력에는 영향 없음) ----
+            else:
+                # ✅ 핵심: benign(=NONE)이어도 ae_score를 무조건 남겨서 Splunk에서 pXX 바로 뽑히게
+                decision = {
+                    "source": "NONE",
+                    "attack": False,
+                    "attack_types": [],
+                    "tcn_topk": tcn_topk,
+                    "tcn_benign_prob": benign_prob,
+                    "ae_score": ae_score,              # <-- 여기
+                    "ae_threshold": self.ae_threshold, # <-- 여기
+                    "agg_mode": self.ae_agg_mode,
+                    "ae_topk": self.ae_topk,
+                }
+
+            # ---- debug meta ----
             imputed_ratios = [float(r.get("_debug_imputed_ratio", 0.0)) for r in w.rows]
             miss_ns = [int(r.get("_debug_missing_n", 0)) for r in w.rows]
             imp_ns = [int(r.get("_debug_imputed_n", 0)) for r in w.rows]
@@ -365,7 +403,7 @@ class FusionService:
             csv_sources = sorted({str(r.get("_debug_csv")) for r in w.rows if r.get("_debug_csv")})[:3]
             header_hash = sorted({str(r.get("_debug_header_hash")) for r in w.rows if r.get("_debug_header_hash")})[:3]
 
-            meta = {
+            meta: Dict[str, Any] = {
                 "seq_len": self.seq_len,
                 "stride": self.stride,
                 "ae_used": ae_used,
@@ -386,6 +424,7 @@ class FusionService:
                     "imputer_ratio_mean": imp_ratio_mean,
                     "missing_n_mean": miss_n_mean,
                     "imputed_n_mean": imp_n_mean,
+                    "tcn_attack_any": bool(tcn_attack_any),
                 }
 
             events.append({"dst_ip": w.dst_ip, "real_len": int(w.real_len), "decision": decision, "meta": meta})
@@ -396,7 +435,7 @@ class FusionService:
                     request_id=request_id,
                     dst_ip=w.dst_ip,
                     real_len=int(w.real_len),
-                    topk=topk,
+                    tcn_topk=tcn_topk,
                     decision_source=decision.get("source"),
                     attack=bool(decision.get("attack")),
                     attack_types=decision.get("attack_types"),
@@ -405,6 +444,7 @@ class FusionService:
                     missing_n_mean=miss_n_mean,
                     imputed_n_mean=imp_n_mean,
                     ae_score=ae_score,
+                    tcn_benign_prob=benign_prob,
                 )
 
         if hec is not None and events:
@@ -463,7 +503,11 @@ class FusionService:
 
         if self.sort_by_timestamp:
             try:
-                rows.sort(key=lambda r: r.get("Timestamp") if r.get("Timestamp") is not None else pd.Timestamp("1970-01-01"))
+                rows.sort(
+                    key=lambda r: r.get("Timestamp")
+                    if r.get("Timestamp") is not None
+                    else pd.Timestamp("1970-01-01")
+                )
             except Exception:
                 pass
 
@@ -489,7 +533,7 @@ class FusionService:
         avg_flows_per_src = total_flows / unique_src if unique_src > 0 else 0.0
         src_ent_raw = _shannon_entropy(counts) if unique_src > 0 and len(counts) > 0 else 0.0
 
-        # ✅ NaT/파싱 꼬임 제거 + duration 최소값(1초) 하드 클램프
+        # duration (최소 1초 클램프)
         ts_list: List[pd.Timestamp] = []
         for r in rows:
             ts = r.get("Timestamp")
@@ -514,6 +558,7 @@ class FusionService:
 
         flow_rate = total_flows / window_duration
 
+        # window features (정규화된 값)
         f1 = np.log1p(unique_src) / 5.0
         f2 = np.log1p(avg_flows_per_src) / 5.0
         if unique_src > 1:
